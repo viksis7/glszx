@@ -1,0 +1,1956 @@
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  ComposedChart,
+  Area,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceArea,
+  ReferenceLine,
+  Scatter,
+} from "recharts";
+
+
+const TARGET_RANGE = { low: 3.9, high: 10.0 }; // ммоль/л, из отчета п.1.4
+
+const API_BASE = process.env.REACT_APP_API_BASE_URL;
+
+const RANGE_OPTIONS = [
+  { key: "1h", label: "1ч", ms: 1 * 60 * 60 * 1000 },
+  { key: "6h", label: "6ч", ms: 6 * 60 * 60 * 1000 },
+  { key: "24h", label: "24ч", ms: 24 * 60 * 60 * 1000 },
+  { key: "7d", label: "7д", ms: 7 * 24 * 60 * 60 * 1000 },
+];
+
+// Две прогнозные модели, которые нужно показывать параллельно.
+const MODELS = {
+  nn: { key: "nn", label: "Нейросеть", color: "#0F6E56" },
+  ode: { key: "ode", label: "ОДУ-модель", color: "#7A3FA0" },
+};
+
+
+
+const LS_SESSION_KEY = "gd_session";
+const LS_DIRECTORY_KEY = "gd_directory"; // все, кто когда-либо регистрировался
+const LS_HOSPITALS_KEY = "gd_hospitals";
+
+function genId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return "id-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJSON(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+   
+  }
+}
+
+function loadSession() {
+  return loadJSON(LS_SESSION_KEY, null);
+}
+function saveSession(session) {
+  saveJSON(LS_SESSION_KEY, session);
+}
+function clearSession() {
+  try {
+    window.localStorage.removeItem(LS_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function loadDirectory() {
+  return loadJSON(LS_DIRECTORY_KEY, []);
+}
+function addToDirectory(entry) {
+  const dir = loadDirectory();
+  dir.push(entry);
+  saveJSON(LS_DIRECTORY_KEY, dir);
+  return dir;
+}
+
+function loadHospitals() {
+  return loadJSON(LS_HOSPITALS_KEY, []);
+}
+function findOrCreateHospital(name) {
+  const hospitals = loadHospitals();
+  const existing = hospitals.find(
+    (h) => h.name.trim().toLowerCase() === name.trim().toLowerCase()
+  );
+  if (existing) return existing;
+  const created = { id: genId(), name: name.trim() };
+  saveJSON(LS_HOSPITALS_KEY, [...hospitals, created]);
+  return created;
+}
+
+// POST /v1/user — реальный бэкенд-эндпоинт (handlerCreateUser).
+// Тело: { name }. Ответ: { ID, Name } (PascalCase — в User нет json-тегов).
+async function registerBackendUser(name) {
+  const res = await fetch(`${API_BASE}/v1/user`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(`network: ${res.status}`);
+  return res.json();
+}
+
+// Glucose/PredictedValue у бэкенда — строки (sqlc мапит NUMERIC/DECIMAL из
+// Postgres в string), поэтому всегда парсим через parseFloat.
+function toNum(v) {
+  const n = typeof v === "string" ? parseFloat(v) : v;
+  return Number.isFinite(n) ? n : null;
+}
+
+// sql.NullFloat64 в Go в зависимости от версии сериализуется в JSON либо как
+// {"Float64":85.2,"Valid":true}, либо (в новых версиях database/sql) просто
+// как число/null. Обрабатываем оба варианта, чтобы не упасть на любой из них.
+function toAccuracy(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return v;
+  if (typeof v === "object" && "Valid" in v) return v.Valid ? v.Float64 : null;
+  return null;
+}
+
+
+async function fetchPatientSnapshot(patientId) {
+  const res = await fetch(`${API_BASE}/v1/glucose_levels`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patient: patientId }),
+  });
+  if (!res.ok) throw new Error(`network: ${res.status}`);
+  return res.json();
+}
+
+// Вся история измерений пациента (без ограничения по времени — бэкенд отдаёт
+// всё сразу), отсортированная по времени. Фильтрация по выбранному диапазону
+// (1ч/6ч/24ч/7д) делается уже здесь, на фронте.
+function buildFullHistory(readings) {
+  return [...(readings || [])]
+    .map((r) => ({
+      t: new Date(r.TimeOfReading).getTime(),
+      time: r.TimeOfReading,
+      actual: toNum(r.Glucose),
+    }))
+    .sort((a, b) => a.t - b.t);
+}
+
+function filterHistoryByRange(fullHistory, rangeKey) {
+  const cfg = RANGE_OPTIONS.find((r) => r.key === rangeKey) || RANGE_OPTIONS[2];
+  const cutoff = Date.now() - cfg.ms;
+  return fullHistory.filter((d) => d.t >= cutoff);
+}
+
+
+function buildFutureForecastRows(modelPredictions, oduPredictions) {
+  const map = new Map();
+  (modelPredictions || []).forEach((p) => {
+    const t = new Date(p.TimePredicted).getTime();
+    const entry = map.get(t) || { t };
+    entry.forecastNN = toNum(p.PredictedValue);
+    map.set(t, entry);
+  });
+  (oduPredictions || []).forEach((p) => {
+    const t = new Date(p.TimePredicted).getTime();
+    const entry = map.get(t) || { t };
+    entry.forecastODE = toNum(p.PredictedValue);
+    map.set(t, entry);
+  });
+  return Array.from(map.values()).sort((a, b) => a.t - b.t);
+}
+
+function latestReadingFrom(fullHistory) {
+  if (fullHistory.length === 0) return null;
+  const last = fullHistory[fullHistory.length - 1];
+  if (last.actual == null) return null;
+  return {
+    value: last.actual,
+    measuredAt: last.time,
+    status: classify(last.actual),
+  };
+}
+
+function latestForecastFrom(predictions, modelVersionFallback) {
+  const sorted = [...(predictions || [])].sort(
+    (a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted)
+  );
+  if (sorted.length === 0) return null;
+  const next = sorted[0];
+  const value = toNum(next.PredictedValue);
+  if (value == null) return null;
+  return {
+    value,
+    forecastFor: next.TimePredicted,
+    modelVersion: next.ModelVersion || modelVersionFallback,
+    accuracy: toAccuracy(next.Accuracy) ?? 0,
+  };
+}
+
+// Статистика считается на фронте из уже полученной истории — отдельного
+// эндпоинта под неё на бэкенде пока нет.
+function computeStats(historyRows) {
+  const values = historyRows.map((d) => d.actual).filter((v) => v != null);
+  if (values.length === 0) return { average: 0, min: 0, max: 0, timeInRange: 0 };
+  const avg = values.reduce((a, b) => a + b, 0) / values.length;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const inRange =
+    values.filter((v) => v >= TARGET_RANGE.low && v <= TARGET_RANGE.high).length /
+    values.length;
+  return {
+    average: Number(avg.toFixed(1)),
+    min: Number(min.toFixed(1)),
+    max: Number(max.toFixed(1)),
+    timeInRange: Number((inRange * 100).toFixed(1)),
+  };
+}
+
+
+const FOOD_DATABASE = [
+  { name: "Овсянка на воде", calories: 88, protein: 3, fat: 1.7, carbs: 15 },
+  { name: "Гречка варёная", calories: 110, protein: 4, fat: 1.1, carbs: 21 },
+  { name: "Рис белый варёный", calories: 116, protein: 2.2, fat: 0.5, carbs: 25 },
+  { name: "Куриная грудка варёная", calories: 165, protein: 31, fat: 3.6, carbs: 0 },
+  { name: "Лосось запечённый", calories: 208, protein: 20, fat: 13, carbs: 0 },
+  { name: "Яйцо куриное", calories: 155, protein: 13, fat: 11, carbs: 1.1 },
+  { name: "Творог 5%", calories: 121, protein: 17, fat: 5, carbs: 3 },
+  { name: "Йогурт натуральный", calories: 66, protein: 3.5, fat: 3.2, carbs: 4.7 },
+  { name: "Хлеб цельнозерновой", calories: 247, protein: 13, fat: 3.4, carbs: 41 },
+  { name: "Банан", calories: 89, protein: 1.1, fat: 0.3, carbs: 23 },
+  { name: "Яблоко", calories: 52, protein: 0.3, fat: 0.2, carbs: 14 },
+  { name: "Миндаль", calories: 579, protein: 21, fat: 50, carbs: 22 },
+  { name: "Картофель варёный", calories: 82, protein: 2, fat: 0.1, carbs: 17 },
+  { name: "Макароны варёные", calories: 131, protein: 5, fat: 1.1, carbs: 25 },
+  { name: "Молоко 2.5%", calories: 52, protein: 2.8, fat: 2.5, carbs: 4.7 },
+  { name: "Сыр твёрдый", calories: 350, protein: 25, fat: 27, carbs: 0 },
+  { name: "Салат овощной", calories: 25, protein: 1.2, fat: 0.2, carbs: 4.5 },
+  { name: "Мёд", calories: 304, protein: 0.3, fat: 0, carbs: 82 },
+  { name: "Гранола", calories: 471, protein: 10, fat: 20, carbs: 64 },
+  { name: "Авокадо", calories: 160, protein: 2, fat: 14.7, carbs: 8.5 },
+];
+
+function findFoodMatches(query) {
+  const q = query.trim().toLowerCase();
+  if (q.length < 2) return [];
+  return FOOD_DATABASE.filter((f) => f.name.toLowerCase().includes(q)).slice(0, 6);
+}
+
+// Масштабирует значения продукта (заданы на 100 г) под введённую порцию.
+function computeMacros(food, grams) {
+  const factor = grams / 100;
+  return {
+    calories: Math.round(food.calories * factor),
+    protein: Number((food.protein * factor).toFixed(1)),
+    fat: Number((food.fat * factor).toFixed(1)),
+    carbs: Number((food.carbs * factor).toFixed(1)),
+  };
+}
+
+// GET /api/patients/{id}/nutrition-log (пока не реализовано на бэкенде)
+async function fetchNutritionLog(patientId) {
+  await delay(200);
+  return [
+    {
+      id: "n1",
+      time: "08:22",
+      food: "Овсянка на воде",
+      grams: 250,
+      ...computeMacros(FOOD_DATABASE[0], 250),
+    },
+    {
+      id: "n2",
+      time: "13:10",
+      food: "Гречка варёная",
+      grams: 200,
+      ...computeMacros(FOOD_DATABASE[1], 200),
+    },
+    {
+      id: "n3",
+      time: "19:45",
+      food: "Лосось запечённый",
+      grams: 150,
+      ...computeMacros(FOOD_DATABASE[4], 150),
+    },
+  ];
+}
+
+// POST /api/patients/{id}/forecast/what-if  { carbsG, proteinG, activityMin }
+// (пока не реализовано на бэкенде — считается локально на фронте).
+// Возвращает проекцию В БУДУЩЕЕ от последней известной точки истории —
+// именно так сценарий "что если" показан на макете (линия продолжает
+// график вперёд, а не накладывается на уже прошедшие данные). Эффект
+// применяется резко в первые же шаги, чтобы изменение сразу бросалось
+// в глаза, а не терялось в плавном нарастании.
+async function fetchWhatIfForecast(patientId, params, baseHistory) {
+  await delay(350);
+  if (baseHistory.length === 0) return { points: [], netEffect: 0 };
+
+  const rnd = seedRandom(
+    Math.round(params.carbsG * 3 + params.proteinG * 5 + params.activityMin + 1)
+  );
+  const carbEffect = params.carbsG * 0.06;
+  const proteinEffect = params.proteinG * 0.025;
+  const activityEffect = -params.activityMin * 0.05;
+  const netEffect = carbEffect + proteinEffect + activityEffect;
+
+  const last = baseHistory[baseHistory.length - 1];
+  const stepMs =
+    baseHistory.length >= 2
+      ? last.t - baseHistory[baseHistory.length - 2].t
+      : 30 * 60000;
+
+  const horizon = 8; // на сколько шагов вперёд строим сценарий
+  // Доля общего эффекта, применяемая на каждом шаге: основной скачок сразу
+  // на первых 2 шагах, дальше — плавный хвост.
+  const stepWeights = [0.4, 0.7, 0.85, 0.93, 0.97, 0.99, 1, 1];
+  const points = [{ t: last.t, whatIf: last.actual }]; // точка стыковки с фактом
+  for (let i = 0; i < horizon; i++) {
+    const value = Math.max(
+      3,
+      last.actual + netEffect * stepWeights[i] + (rnd() - 0.5) * 0.2
+    );
+    points.push({ t: last.t + (i + 1) * stepMs, whatIf: Number(value.toFixed(2)) });
+  }
+  return { points, netEffect: Number(netEffect.toFixed(2)) };
+}
+
+function seedRandom(seed) {
+  let s = seed;
+  return () => {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+
+function classify(value) {
+  if (value < TARGET_RANGE.low) return "hypo";
+  if (value > TARGET_RANGE.high) return "hyper";
+  return "normal";
+}
+
+// Общие, широко распространённые рекомендации (по типу "правила 15-15" от
+// диабетических ассоциаций). Это НЕ медицинское назначение — конкретные
+// пороги и действия для конкретного пациента должен определять его врач.
+// Если у пациента есть индивидуальный план — эти тексты нужно заменить на
+// него (см. поле patient.carePlan, если оно появится в реальном API).
+function getGlucoseTips(value, status) {
+  if (status === "hypo") {
+    if (value < 3.0) {
+      return {
+        severity: "critical",
+        title: "Очень низкий уровень глюкозы",
+        text:
+          "Съешьте 15–20 г быстрых углеводов (сок, глюкозные таблетки, мёд). Проверьте уровень через 15 минут. Если улучшения нет — обратитесь за помощью.",
+      };
+    }
+    return {
+      severity: "warning",
+      title: "Низкий уровень глюкозы",
+      text:
+        "Рассмотрите приём быстрых углеводов: сок, мёд, сладкий напиток (~15 г). Перепроверьте показатель через 15 минут («правило 15/15»).",
+    };
+  }
+  if (status === "hyper") {
+    if (value > 13.9) {
+      return {
+        severity: "critical",
+        title: "Очень высокий уровень глюкозы",
+        text:
+          "Пейте воду небольшими порциями, избегайте дополнительных быстрых углеводов. При плохом самочувствии или наличии кетонов — свяжитесь с врачом.",
+      };
+    }
+    return {
+      severity: "warning",
+      title: "Повышенный уровень глюкозы",
+      text:
+        "Ограничьте быстрые углеводы в ближайший приём пищи, добавьте лёгкую физическую активность, если это разрешено вашим планом лечения.",
+    };
+  }
+  return null;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(fn, { retries = 3 } = {}) {
+  let attempt = 0;
+  let lastErr;
+  while (attempt <= retries) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      attempt += 1;
+      if (attempt > retries) break;
+      await delay(300 * 2 ** attempt);
+    }
+  }
+  throw lastErr;
+}
+
+// ============================================================================
+// UI-константы
+// ============================================================================
+
+const STATUS_META = {
+  normal: { label: "Норма", color: "#0F6E56", bg: "#E1F5EE" },
+  hypo: { label: "Гипогликемия", color: "#993C1D", bg: "#FAECE7" },
+  hyper: { label: "Гипергликемия", color: "#993C1D", bg: "#FAECE7" },
+};
+
+// Находит значение "actual" из истории, ближайшее по времени к моменту t —
+// используется, чтобы отметка инсулина на графике визуально стояла на кривой.
+function nearestActualValue(historyRows, t) {
+  if (historyRows.length === 0) return null;
+  let best = historyRows[0];
+  let bestDiff = Math.abs(best.t - t);
+  for (const r of historyRows) {
+    const diff = Math.abs(r.t - t);
+    if (diff < bestDiff) {
+      best = r;
+      bestDiff = diff;
+    }
+  }
+  return best.actual;
+}
+
+function formatTime(iso, rangeKey) {
+  const d = new Date(iso);
+  if (rangeKey === "7d") {
+    return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
+  }
+  return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+}
+
+function toCsv(rows) {
+  const header = "time,actual_mmol_l,forecast_nn_mmol_l,forecast_ode_mmol_l\n";
+  const body = rows
+    .map(
+      (d) =>
+        `${new Date(d.t).toISOString()},${d.actual ?? ""},${d.forecastNN ?? ""},${
+          d.forecastODE ?? ""
+        }`
+    )
+    .join("\n");
+  return header + body;
+}
+
+function downloadCsv(history, patientName) {
+  const csv = toCsv(history);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `glucose_${patientName.replace(/\s+/g, "_")}_${Date.now()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ============================================================================
+// Компонент
+// ============================================================================
+
+function Dashboard({ session, onLogout }) {
+  // Список пациентов зависит от роли: админ видит всех пациентов своей
+  // больницы (из локального справочника), обычный пользователь — только себя.
+  const patients = useMemo(() => {
+    if (session.role === "admin") {
+      const dir = loadDirectory();
+      const own = dir.filter(
+        (u) => u.hospitalId === session.hospitalId && u.role === "user"
+      );
+      return own.length > 0 ? own : [{ id: session.id, name: session.name }];
+    }
+    return [{ id: session.id, name: session.name }];
+  }, [session]);
+
+  const [patientId, setPatientId] = useState(patients[0].id);
+  const [rangeKey, setRangeKey] = useState("24h");
+  const [connected, setConnected] = useState(true);
+
+  // Сырой ответ бэкенда целиком: { readings, model_predictions, odu_predictions }
+  const [snapshot, setSnapshot] = useState(null);
+  const [debugOverride, setDebugOverride] = useState("");
+  const [nutritionLog, setNutritionLog] = useState([]);
+  const [insulinDoses, setInsulinDoses] = useState([]);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const [whatIf, setWhatIf] = useState({ carbsG: 0, proteinG: 0, activityMin: 0 });
+  const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
+  const [whatIfLoading, setWhatIfLoading] = useState(false);
+
+  const patient = patients.find((p) => p.id === patientId) || patients[0];
+  const pollRef = useRef(null);
+
+  // Вся история пациента (без ограничения по времени — бэкенд отдаёт всё сразу).
+  const fullHistory = useMemo(
+    () => buildFullHistory(snapshot?.readings),
+    [snapshot]
+  );
+  // История, отфильтрованная под выбранный диапазон (1ч/6ч/24ч/7д) — фильтр
+  // чисто клиентский, новый запрос на бэкенд при смене диапазона не нужен.
+  const history = useMemo(
+    () => filterHistoryByRange(fullHistory, rangeKey),
+    [fullHistory, rangeKey]
+  );
+  const latest = useMemo(() => latestReadingFrom(fullHistory), [fullHistory]);
+  const forecastNN = useMemo(
+    () => latestForecastFrom(snapshot?.model_predictions, "nn"),
+    [snapshot]
+  );
+  const forecastODE = useMemo(
+    () => latestForecastFrom(snapshot?.odu_predictions, "ode"),
+    [snapshot]
+  );
+  const futureForecastRows = useMemo(
+    () => buildFutureForecastRows(snapshot?.model_predictions, snapshot?.odu_predictions),
+    [snapshot]
+  );
+  const stats = useMemo(() => computeStats(history), [history]);
+
+  const loadAll = useCallback(async () => {
+    try {
+      const [snapshotRes, nutritionRes] = await Promise.all([
+        withRetry(() => fetchPatientSnapshot(patientId)),
+        withRetry(() => fetchNutritionLog(patientId)),
+      ]);
+      setSnapshot(snapshotRes);
+      setNutritionLog(nutritionRes);
+      setConnected(true);
+      setError(null);
+    } catch (err) {
+      setConnected(false);
+      setError("Не удалось получить данные с сервера.");
+    } finally {
+      setLoading(false);
+    }
+  }, [patientId]);
+
+  useEffect(() => {
+    setLoading(true);
+    loadAll();
+  }, [loadAll]);
+
+  // Автообновление — п.1.6 отчета: каждые 30 секунд перезапрашиваем снапшот
+  // целиком (бэкенд отдаёт всё одним запросом, отдельного "latest" эндпоинта нет).
+  useEffect(() => {
+    pollRef.current = setInterval(async () => {
+      try {
+        const snapshotRes = await fetchPatientSnapshot(patientId);
+        setSnapshot(snapshotRes);
+        setConnected(true);
+      } catch {
+        setConnected(false);
+      }
+    }, 30000);
+    return () => clearInterval(pollRef.current);
+  }, [patientId]);
+
+  const runWhatIf = useCallback(
+    async (params) => {
+      if (history.length === 0) return;
+      setWhatIfLoading(true);
+      try {
+        const res = await withRetry(() => fetchWhatIfForecast(patientId, params, history));
+        setWhatIfData(res);
+      } catch {
+        // сценарий "что если" необязателен — тихо игнорируем сбой
+      } finally {
+        setWhatIfLoading(false);
+      }
+    },
+    [patientId, history]
+  );
+
+  useEffect(() => {
+    const t = setTimeout(() => runWhatIf(whatIf), 250); // debounce слайдеров
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [whatIf, history]);
+
+  const chartData = useMemo(() => {
+    const historyRows = history.map((d) => ({
+      t: d.t,
+      label: formatTime(d.time, rangeKey),
+      actual: d.actual,
+      forecastNN: null,
+      forecastODE: null,
+      whatIf: null,
+      insulinDose: null,
+      insulinUnits: null,
+    }));
+
+    const forecastRows = futureForecastRows.map((d) => ({
+      t: d.t,
+      label: formatTime(new Date(d.t).toISOString(), rangeKey),
+      actual: null,
+      forecastNN: d.forecastNN ?? null,
+      forecastODE: d.forecastODE ?? null,
+      whatIf: null,
+      insulinDose: null,
+      insulinUnits: null,
+    }));
+
+    let rows = [...historyRows, ...forecastRows].sort((a, b) => a.t - b.t);
+
+    // Сценарий "что если" накладываем поверх уже собранных рядов: первая
+    // точка whatIfData совпадает по времени с последней точкой истории
+    // (нужна только для стыковки линий), остальные — новые точки в будущем.
+    const whatIfPoints = whatIfData.points;
+    if (historyRows.length > 0 && whatIfPoints.length > 0) {
+      const [anchor, ...future] = whatIfPoints;
+      const anchorIdx = rows.findIndex((r) => r.t === anchor.t);
+      if (anchorIdx !== -1) {
+        rows[anchorIdx] = { ...rows[anchorIdx], whatIf: anchor.whatIf };
+      }
+      const whatIfFutureRows = future.map((d) => ({
+        t: d.t,
+        label: formatTime(new Date(d.t).toISOString(), rangeKey),
+        actual: null,
+        forecastNN: null,
+        forecastODE: null,
+        whatIf: d.whatIf,
+        insulinDose: null,
+        insulinUnits: null,
+      }));
+      rows = [...rows, ...whatIfFutureRows].sort((a, b) => a.t - b.t);
+    }
+
+    // Отметки инсулина — только на фронте (для демонстрации). Ставим маркер
+    // на высоте ближайшего по времени значения глюкозы, чтобы он визуально
+    // сидел прямо на кривой, а не висел в произвольном месте графика.
+    const cfg = RANGE_OPTIONS.find((r) => r.key === rangeKey) || RANGE_OPTIONS[2];
+    const cutoff = Date.now() - cfg.ms;
+    const visibleDoses = insulinDoses.filter((d) => d.t >= cutoff);
+    if (visibleDoses.length > 0 && history.length > 0) {
+      const insulinRows = visibleDoses.map((dose) => ({
+        t: dose.t,
+        label: formatTime(new Date(dose.t).toISOString(), rangeKey),
+        actual: null,
+        forecastNN: null,
+        forecastODE: null,
+        whatIf: null,
+        insulinDose: nearestActualValue(history, dose.t),
+        insulinUnits: dose.units,
+      }));
+      rows = [...rows, ...insulinRows].sort((a, b) => a.t - b.t);
+    }
+
+    return rows;
+  }, [history, futureForecastRows, whatIfData, rangeKey, insulinDoses]);
+
+  const yDomain = useMemo(() => {
+    const values = chartData.flatMap((d) =>
+      [d.actual, d.forecastNN, d.forecastODE, d.whatIf].filter((v) => v != null)
+    );
+    if (values.length === 0) return [3, 12];
+    return [Math.floor(Math.min(...values, 3)) - 0.5, Math.ceil(Math.max(...values, 11)) + 0.5];
+  }, [chartData]);
+
+  // Позволяет вручную подставить значение глюкозы для проверки подсказок
+  // (гипо/гипергликемия) — реальные данные бэкенда/заглушки не трогает.
+  const displayedLatest = useMemo(() => {
+    if (debugOverride === "" || latest == null) return latest;
+    const value = Number(debugOverride);
+    if (Number.isNaN(value)) return latest;
+    return { ...latest, value, status: classify(value) };
+  }, [latest, debugOverride]);
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.card}>
+        <Header
+          patient={patient}
+          patients={patients}
+          onPatientChange={setPatientId}
+          connected={connected}
+          session={session}
+          onLogout={onLogout}
+        />
+
+        {error && (
+          <div style={styles.errorBanner}>
+            <span>{error}</span>
+            <button style={styles.retryBtn} onClick={loadAll}>
+              Повторить
+            </button>
+          </div>
+        )}
+
+        <DebugPanel value={debugOverride} onChange={setDebugOverride} />
+
+        <div style={styles.statusRow}>
+          <GlucoseCard latest={displayedLatest} loading={loading} />
+          <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
+          <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
+        </div>
+
+        {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
+
+        <RangeSelector rangeKey={rangeKey} onChange={setRangeKey} />
+
+        <ChartBlock
+          data={chartData}
+          yDomain={yDomain}
+          rangeKey={rangeKey}
+          loading={loading}
+          onExport={() => downloadCsv(chartData, patient.name)}
+          nowLabel={
+            history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
+          }
+        />
+
+        <WhatIfSimulator
+          whatIf={whatIf}
+          onChange={setWhatIf}
+          loading={whatIfLoading}
+          netEffect={whatIfData.netEffect}
+        />
+
+        <InsulinPanel
+          doses={insulinDoses}
+          onAdd={(dose) => setInsulinDoses((prev) => [...prev, dose])}
+        />
+
+        <div style={styles.bottomRow}>
+          <NutritionLog
+            entries={nutritionLog}
+            onAdd={(entry) => setNutritionLog((prev) => [...prev, entry])}
+          />
+          <Statistics stats={stats} loading={loading} />
+        </div>
+
+        <Footer />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Подкомпоненты
+// ============================================================================
+
+function Header({ patient, patients, onPatientChange, connected, session, onLogout }) {
+  return (
+    <div style={styles.header}>
+      <div style={styles.logo}>
+        <div style={styles.logoMark} />
+        <span style={styles.logoText}>Цифровой двойник гликемии</span>
+      </div>
+      <div style={styles.headerRight}>
+        <div style={styles.sessionInfo}>
+          <span style={styles.roleBadge}>
+            {session.role === "admin" ? "Администратор" : "Пациент"}
+          </span>
+          <span style={styles.smallMuted}>{session.hospitalName}</span>
+        </div>
+
+        {session.role === "admin" ? (
+          <label style={styles.patientLabel}>
+            Пациент:
+            <select
+              value={patient.id}
+              onChange={(e) => onPatientChange(e.target.value)}
+              style={styles.select}
+            >
+              {patients.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <span style={styles.patientLabel}>{patient.name}</span>
+        )}
+
+        <div style={styles.connectionIndicator}>
+          <span
+            style={{
+              ...styles.connectionDot,
+              background: connected ? "#0F6E56" : "#993C1D",
+            }}
+          />
+          {connected ? "Подключено" : "Нет соединения"}
+        </div>
+
+        <button style={styles.logoutBtn} onClick={onLogout}>
+          Выйти
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Панель только для ручной проверки во время разработки/защиты — позволяет
+// подставить любое значение глюкозы и увидеть, как меняется статус и
+// баннер с подсказкой. Перед сдачей в продакшн этот блок нужно убрать
+// или спрятать за флагом окружения (например, process.env.NODE_ENV).
+function DebugPanel({ value, onChange }) {
+  return (
+    <div style={styles.debugPanel}>
+      <span style={styles.debugLabel}>Тест: подставить уровень глюкозы</span>
+      <input
+        type="number"
+        step="0.1"
+        placeholder="напр. 3.2 или 11.5"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={styles.debugInput}
+      />
+      <span style={styles.debugHint}>
+        {"< 3.9 — гипо, > 10.0 — гипер, между — норма"}
+      </span>
+      {value !== "" && (
+        <button style={styles.debugReset} onClick={() => onChange("")}>
+          Сбросить
+        </button>
+      )}
+    </div>
+  );
+}
+
+function GlucoseCard({ latest, loading }) {
+  const meta = latest ? STATUS_META[latest.status] : null;
+  return (
+    <div style={styles.statCard}>
+      <div style={styles.statCardLabel}>Текущая глюкоза</div>
+      {loading || !latest ? (
+        <div style={styles.skeleton} />
+      ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+            <span style={styles.bigValue}>{latest.value} ммоль/л</span>
+            <span
+              style={{
+                ...styles.badge,
+                color: meta.color,
+                background: meta.bg,
+              }}
+            >
+              {meta.label}
+            </span>
+          </div>
+          <div style={styles.smallMuted}>
+            {new Date(latest.measuredAt).toLocaleTimeString("ru-RU", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ForecastCard({ model, forecast, loading }) {
+  return (
+    <div style={styles.statCard}>
+      <div style={styles.statCardLabel}>
+        Прогноз
+        <span style={{ ...styles.modelTag, color: model.color }}>
+          {" "}
+          · {model.label}
+        </span>
+      </div>
+      {loading || !forecast ? (
+        <div style={styles.skeleton} />
+      ) : (
+        <>
+          <span style={styles.bigValue}>{forecast.value} ммоль/л</span>
+          <div style={styles.smallMuted}>
+            на{" "}
+            {new Date(forecast.forecastFor).toLocaleTimeString("ru-RU", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+            {" · "}
+            {forecast.modelVersion}
+            {" · точность "}
+            {Math.round(forecast.accuracy * 100)}%
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TipsBanner({ latest }) {
+  const tip = getGlucoseTips(latest.value, latest.status);
+  if (!tip) return null;
+
+  const palette =
+    tip.severity === "critical"
+      ? { color: "#712B13", bg: "#FAECE7", border: "#E5A188" }
+      : { color: "#8A5A12", bg: "#FBF2E1", border: "#E6C27A" };
+
+  return (
+    <div
+      style={{
+        ...styles.tipsBanner,
+        background: palette.bg,
+        borderColor: palette.border,
+      }}
+    >
+      <div style={{ ...styles.tipsTitle, color: palette.color }}>{tip.title}</div>
+      <div style={{ ...styles.tipsText, color: palette.color }}>{tip.text}</div>
+      <div style={styles.tipsDisclaimer}>
+        Общая информация, не заменяет назначения врача.
+      </div>
+    </div>
+  );
+}
+
+function RangeSelector({ rangeKey, onChange }) {
+  return (
+    <div style={styles.rangeRow}>
+      {RANGE_OPTIONS.map((opt) => (
+        <button
+          key={opt.key}
+          onClick={() => onChange(opt.key)}
+          style={{
+            ...styles.rangeBtn,
+            ...(rangeKey === opt.key ? styles.rangeBtnActive : {}),
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ChartBlock({ data, yDomain, rangeKey, loading, onExport, nowLabel }) {
+  const lastLabel = data.length ? data[data.length - 1].label : null;
+  const hasScenario = nowLabel && lastLabel && nowLabel !== lastLabel;
+
+  return (
+    <div style={styles.chartBlock}>
+      <div style={styles.chartHeaderRow}>
+        <Legend />
+        <button style={styles.exportBtn} onClick={onExport} disabled={loading}>
+          Экспорт в CSV
+        </button>
+      </div>
+      <div style={{ width: "100%", height: 260 }}>
+        <ResponsiveContainer>
+          <ComposedChart data={data} margin={{ top: 24, right: 10, left: -10, bottom: 0 }}>
+            <CartesianGrid stroke="#e1e0d9" vertical={false} />
+            <XAxis
+              dataKey="label"
+              tick={{ fontSize: 11, fill: "#898781" }}
+              minTickGap={30}
+              axisLine={{ stroke: "#c3c2b7" }}
+              tickLine={false}
+            />
+            <YAxis
+              domain={yDomain}
+              tick={{ fontSize: 11, fill: "#898781" }}
+              axisLine={false}
+              tickLine={false}
+              width={36}
+            />
+            <ReferenceArea
+              y1={TARGET_RANGE.low}
+              y2={TARGET_RANGE.high}
+              fill="#5DCAA5"
+              fillOpacity={0.12}
+              ifOverflow="extendDomain"
+            />
+            {/* Явно закрашенная зона сценария "что если" справа от "Сейчас" —
+                видна даже если саму линию сложно разглядеть. */}
+            {hasScenario && (
+              <ReferenceArea
+                x1={nowLabel}
+                x2={lastLabel}
+                fill="#F2A340"
+                fillOpacity={0.14}
+                ifOverflow="extendDomain"
+                label={{
+                  value: "Сценарий «что если»",
+                  position: "insideTop",
+                  fontSize: 11,
+                  fill: "#8A5A12",
+                }}
+              />
+            )}
+            {nowLabel && (
+              <ReferenceLine
+                x={nowLabel}
+                stroke="#898781"
+                strokeDasharray="3 3"
+                label={{ value: "Сейчас", position: "top", fontSize: 11, fill: "#52514e" }}
+              />
+            )}
+            <Tooltip
+              formatter={(value, name, entry) => {
+                if (name === "insulinDose") {
+                  return [`${entry?.payload?.insulinUnits ?? "—"} ед.`, "Инсулин"];
+                }
+                return [
+                  value == null ? "—" : `${value} ммоль/л`,
+                  {
+                    actual: "Факт",
+                    forecastNN: "Прогноз (нейросеть)",
+                    forecastODE: "Прогноз (ОДУ)",
+                    whatIf: "Что если",
+                  }[name] || name,
+                ];
+              }}
+              contentStyle={{ fontSize: 12, borderRadius: 8 }}
+            />
+            <Area
+              type="monotone"
+              dataKey="actual"
+              stroke="#185FA5"
+              strokeWidth={2}
+              fill="#85B7EB"
+              fillOpacity={0.25}
+              dot={false}
+              connectNulls
+              isAnimationActive={false}
+            />
+            <Line
+              type="monotone"
+              dataKey="forecastNN"
+              stroke={MODELS.nn.color}
+              strokeWidth={2}
+              strokeDasharray="5 4"
+              dot={false}
+              connectNulls
+              isAnimationActive={false}
+            />
+            <Line
+              type="monotone"
+              dataKey="forecastODE"
+              stroke={MODELS.ode.color}
+              strokeWidth={2}
+              strokeDasharray="5 4"
+              dot={false}
+              connectNulls
+              isAnimationActive={false}
+            />
+            <Line
+              type="monotone"
+              dataKey="whatIf"
+              stroke="#C2410C"
+              strokeWidth={3}
+              dot={{ r: 4, fill: "#C2410C", stroke: "#fff", strokeWidth: 1 }}
+              connectNulls
+              isAnimationActive={false}
+              label={{
+                position: "top",
+                fontSize: 11,
+                fill: "#C2410C",
+                formatter: (v) => (v == null ? "" : v.toFixed(1)),
+              }}
+            />
+            <Scatter
+              dataKey="insulinDose"
+              isAnimationActive={false}
+              shape={(props) => {
+                const { cx, cy, payload } = props;
+                if (payload.insulinDose == null) return null;
+                return (
+                  <g>
+                    <line
+                      x1={cx}
+                      y1={cy + 8}
+                      x2={cx}
+                      y2={cy - 16}
+                      stroke="#B23A9E"
+                      strokeWidth={2}
+                    />
+                    <circle cx={cx} cy={cy} r={5} fill="#B23A9E" stroke="#fff" strokeWidth={1.5} />
+                    <text
+                      x={cx}
+                      y={cy - 20}
+                      textAnchor="middle"
+                      fontSize={11}
+                      fontWeight={600}
+                      fill="#B23A9E"
+                    >
+                      {payload.insulinUnits} ед.
+                    </text>
+                  </g>
+                );
+              }}
+            />
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function Legend() {
+  const items = [
+    { color: "#185FA5", label: "Факт", dash: false },
+    { color: MODELS.nn.color, label: `Прогноз: ${MODELS.nn.label}`, dash: true },
+    { color: MODELS.ode.color, label: `Прогноз: ${MODELS.ode.label}`, dash: true },
+    { color: "#C2410C", label: "Сценарий «что если»", dash: false },
+    { color: "#B23A9E", label: "Инсулин", swatch: false, dot: true },
+    { color: "#5DCAA5", label: "Целевой диапазон", swatch: true },
+  ];
+  return (
+    <div style={styles.legendRow}>
+      {items.map((it) => (
+        <span key={it.label} style={styles.legendItem}>
+          <span
+            style={{
+              ...styles.legendMark,
+              background: it.swatch ? it.color : it.dot ? it.color : "transparent",
+              borderRadius: it.dot ? "50%" : undefined,
+              width: it.dot ? 10 : undefined,
+              height: it.dot ? 10 : undefined,
+              borderTop: it.swatch || it.dot ? "none" : `2px ${it.dash ? "dashed" : "solid"} ${it.color}`,
+              opacity: it.swatch ? 0.3 : 1,
+            }}
+          />
+          {it.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function WhatIfSimulator({ whatIf, onChange, loading, netEffect }) {
+  const set = (key) => (e) => onChange({ ...whatIf, [key]: Number(e.target.value) });
+  const effectColor = netEffect > 0.05 ? "#993C1D" : netEffect < -0.05 ? "#0F6E56" : "#52514e";
+  return (
+    <div style={styles.whatIfBlock}>
+      <div style={styles.whatIfHeader}>
+        Симулятор «что если»
+        {loading && <span style={styles.smallMuted}> · пересчёт…</span>}
+      </div>
+      <div style={{ ...styles.effectReadout, color: effectColor }}>
+        Ожидаемый эффект: {netEffect > 0 ? "+" : ""}
+        {netEffect.toFixed(1)} ммоль/л к концу сценария
+      </div>
+      <div style={styles.slidersRow}>
+        <SliderField
+          label="Углеводы"
+          unit="г"
+          min={-30}
+          max={60}
+          value={whatIf.carbsG}
+          onChange={set("carbsG")}
+        />
+        <SliderField
+          label="Белки"
+          unit="г"
+          min={-20}
+          max={40}
+          value={whatIf.proteinG}
+          onChange={set("proteinG")}
+        />
+        <SliderField
+          label="Активность"
+          unit="мин"
+          min={0}
+          max={60}
+          value={whatIf.activityMin}
+          onChange={set("activityMin")}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SliderField({ label, unit, min, max, value, onChange }) {
+  return (
+    <div style={styles.sliderField}>
+      <div style={styles.sliderLabelRow}>
+        <span>{label}</span>
+        <span style={styles.sliderValue}>
+          {value > 0 ? "+" : ""}
+          {value} {unit}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={1}
+        value={value}
+        onChange={onChange}
+        style={{ width: "100%" }}
+      />
+    </div>
+  );
+}
+
+function InsulinPanel({ doses, onAdd }) {
+  const [units, setUnits] = useState(4);
+  const [type, setType] = useState("bolus");
+
+  const sorted = [...doses].sort((a, b) => b.t - a.t).slice(0, 5);
+
+  const handleAdd = () => {
+    if (!units || units <= 0) return;
+    const now = new Date();
+    onAdd({
+      id: `ins-${Date.now()}`,
+      t: now.getTime(),
+      time: now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+      units: Number(units),
+      type,
+    });
+  };
+
+  return (
+    <div style={styles.whatIfBlock}>
+      <div style={styles.whatIfHeader}>Дозы инсулина (только для отображения)</div>
+      <div style={styles.insulinFormRow}>
+        <input
+          type="number"
+          min={0.5}
+          step={0.5}
+          value={units}
+          onChange={(e) => setUnits(e.target.value)}
+          style={styles.nutritionGramsInput}
+        />
+        <span style={styles.smallMuted}>ед.</span>
+        <select value={type} onChange={(e) => setType(e.target.value)} style={styles.select}>
+          <option value="bolus">Болюс (короткий)</option>
+          <option value="basal">Базальный (продлённый)</option>
+        </select>
+        <button style={styles.nutritionAddBtn} onClick={handleAdd}>
+          Отметить укол сейчас
+        </button>
+      </div>
+      {sorted.length > 0 && (
+        <div style={styles.insulinList}>
+          {sorted.map((d) => (
+            <span key={d.id} style={styles.insulinListItem}>
+              {d.time} · {d.units} ед. · {d.type === "bolus" ? "болюс" : "базальный"}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NutritionLog({ entries, onAdd }) {
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Журнал питания</div>
+
+      <NutritionEntryForm onAdd={onAdd} />
+
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Время</th>
+            <th style={styles.th}>Продукт</th>
+            <th style={styles.th}>Граммы</th>
+            <th style={styles.th}>Ккал</th>
+            <th style={styles.th}>Б/Ж/У</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((e) => (
+            <tr key={e.id}>
+              <td style={styles.td}>{e.time}</td>
+              <td style={styles.td}>{e.food}</td>
+              <td style={styles.td}>{e.grams} г</td>
+              <td style={styles.td}>{e.calories}</td>
+              <td style={styles.td}>
+                {e.protein}/{e.fat}/{e.carbs}
+              </td>
+            </tr>
+          ))}
+          {entries.length === 0 && (
+            <tr>
+              <td style={styles.td} colSpan={5}>
+                Записей пока нет — добавьте первый приём пищи выше.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function NutritionEntryForm({ onAdd }) {
+  const [query, setQuery] = useState("");
+  const [selectedFood, setSelectedFood] = useState(null);
+  const [grams, setGrams] = useState(150);
+
+  const matches = useMemo(() => findFoodMatches(query), [query]);
+  const preview = selectedFood ? computeMacros(selectedFood, grams) : null;
+
+  const handlePick = (food) => {
+    setSelectedFood(food);
+    setQuery(food.name);
+  };
+
+  const handleAdd = () => {
+    if (!selectedFood || !grams || grams <= 0) return;
+    const macros = computeMacros(selectedFood, grams);
+    onAdd({
+      id: `n-${Date.now()}`,
+      time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+      food: selectedFood.name,
+      grams,
+      ...macros,
+    });
+    setQuery("");
+    setSelectedFood(null);
+    setGrams(150);
+  };
+
+  return (
+    <div style={styles.nutritionForm}>
+      <div style={styles.nutritionFormRow}>
+        <div style={{ position: "relative", flex: 2 }}>
+          <input
+            type="text"
+            placeholder="Название продукта (напр. Гречка)"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setSelectedFood(null);
+            }}
+            style={styles.nutritionInput}
+          />
+          {query && !selectedFood && matches.length > 0 && (
+            <div style={styles.suggestList}>
+              {matches.map((f) => (
+                <div key={f.name} style={styles.suggestItem} onClick={() => handlePick(f)}>
+                  {f.name}
+                  <span style={styles.smallMuted}> · {f.calories} ккал/100г</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {query && !selectedFood && matches.length === 0 && query.trim().length >= 2 && (
+            <div style={styles.suggestEmpty}>Не найдено в базе продуктов</div>
+          )}
+        </div>
+        <input
+          type="number"
+          min={1}
+          value={grams}
+          onChange={(e) => setGrams(Number(e.target.value))}
+          style={styles.nutritionGramsInput}
+        />
+        <span style={styles.smallMuted}>г</span>
+        <button
+          style={styles.nutritionAddBtn}
+          onClick={handleAdd}
+          disabled={!selectedFood}
+        >
+          Добавить
+        </button>
+      </div>
+      {preview && (
+        <div style={styles.nutritionPreview}>
+          {preview.calories} ккал · Б {preview.protein} г · Ж {preview.fat} г · У{" "}
+          {preview.carbs} г
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Statistics({ stats, loading }) {
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Статистика</div>
+      {loading || !stats ? (
+        <div style={styles.skeleton} />
+      ) : (
+        <div style={styles.statsGrid}>
+          <StatRow label="Среднее" value={`${stats.average} ммоль/л`} />
+          <StatRow label="Мин" value={`${stats.min} ммоль/л`} />
+          <StatRow label="Макс" value={`${stats.max} ммоль/л`} />
+          <StatRow label="Время в диапазоне" value={`${stats.timeInRange}%`} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatRow({ label, value }) {
+  return (
+    <div style={styles.statRow}>
+      <span style={styles.smallMuted}>{label}</span>
+      <span style={{ fontWeight: 500 }}>{value}</span>
+    </div>
+  );
+}
+
+function Footer() {
+  return (
+    <div style={styles.footer}>
+      <span>Версия клиента: 0.1.0</span>
+      <a href="#" style={styles.footerLink}>
+        Документация
+      </a>
+    </div>
+  );
+}
+
+// ============================================================================
+// Стили (inline, без внешних зависимостей на CSS-фреймворк)
+// ============================================================================
+
+const styles = {
+  page: {
+    minHeight: "100vh",
+    background: "#EEF0F3",
+    padding: "32px 16px",
+    fontFamily:
+      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    display: "flex",
+    justifyContent: "center",
+  },
+  card: {
+    width: "100%",
+    maxWidth: 960,
+    background: "#ffffff",
+    borderRadius: 20,
+    padding: 28,
+    boxSizing: "border-box",
+  },
+  header: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 12,
+    marginBottom: 20,
+  },
+  logo: { display: "flex", alignItems: "center", gap: 8 },
+  logoMark: {
+    width: 26,
+    height: 26,
+    borderRadius: 8,
+    background: "linear-gradient(135deg, #185FA5, #0F6E56)",
+  },
+  logoText: { fontWeight: 500, fontSize: 16, color: "#0b0b0b" },
+  headerRight: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
+  sessionInfo: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 },
+  roleBadge: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#0C447C",
+    background: "#E7F0FA",
+    borderRadius: 999,
+    padding: "2px 10px",
+  },
+  logoutBtn: {
+    border: "1px solid #d3d1c7",
+    background: "#fff",
+    borderRadius: 8,
+    padding: "6px 12px",
+    fontSize: 12,
+    cursor: "pointer",
+    color: "#52514e",
+  },
+  patientLabel: {
+    fontSize: 13,
+    color: "#52514e",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+  },
+  select: {
+    padding: "6px 10px",
+    borderRadius: 8,
+    border: "1px solid #d3d1c7",
+    fontSize: 13,
+    background: "#fff",
+  },
+  connectionIndicator: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 13,
+    color: "#52514e",
+  },
+  connectionDot: { width: 8, height: 8, borderRadius: "50%" },
+  debugPanel: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+    background: "#F1EFE8",
+    border: "1px dashed #c3c2b7",
+    borderRadius: 10,
+    padding: "8px 12px",
+    marginBottom: 16,
+    fontSize: 12,
+  },
+  debugLabel: { color: "#52514e", fontWeight: 500 },
+  debugInput: {
+    width: 130,
+    padding: "4px 8px",
+    borderRadius: 6,
+    border: "1px solid #d3d1c7",
+    fontSize: 12,
+  },
+  debugHint: { color: "#898781" },
+  debugReset: {
+    border: "1px solid #d3d1c7",
+    background: "#fff",
+    borderRadius: 6,
+    padding: "3px 10px",
+    fontSize: 12,
+    cursor: "pointer",
+  },
+  errorBanner: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    background: "#FAECE7",
+    color: "#712B13",
+    padding: "10px 14px",
+    borderRadius: 10,
+    fontSize: 13,
+    marginBottom: 16,
+  },
+  retryBtn: {
+    border: "1px solid #993C1D",
+    background: "transparent",
+    color: "#712B13",
+    borderRadius: 6,
+    padding: "4px 10px",
+    fontSize: 12,
+    cursor: "pointer",
+  },
+  statusRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gap: 14,
+    marginBottom: 20,
+  },
+  statCard: {
+    border: "1px solid #e1e0d9",
+    borderRadius: 14,
+    padding: "16px 18px",
+    minHeight: 74,
+  },
+  statCardLabel: { fontSize: 12, color: "#898781", marginBottom: 6 },
+  modelTag: { fontSize: 12, fontWeight: 600 },
+  bigValue: { fontSize: 22, fontWeight: 500, color: "#0b0b0b" },
+  badge: {
+    fontSize: 12,
+    fontWeight: 500,
+    padding: "3px 10px",
+    borderRadius: 999,
+  },
+  smallMuted: { fontSize: 12, color: "#898781", marginTop: 4 },
+  skeleton: {
+    height: 34,
+    borderRadius: 6,
+    background: "#f1efe8",
+  },
+  tipsBanner: {
+    border: "1px solid",
+    borderRadius: 12,
+    padding: "12px 16px",
+    marginBottom: 16,
+  },
+  tipsTitle: { fontSize: 13, fontWeight: 600, marginBottom: 4 },
+  tipsText: { fontSize: 13, lineHeight: 1.4 },
+  tipsDisclaimer: {
+    fontSize: 11,
+    color: "#898781",
+    marginTop: 6,
+    fontStyle: "italic",
+  },
+  rangeRow: { display: "flex", gap: 8, marginBottom: 16 },
+  rangeBtn: {
+    border: "1px solid #d3d1c7",
+    background: "#fff",
+    borderRadius: 999,
+    padding: "6px 16px",
+    fontSize: 13,
+    cursor: "pointer",
+    color: "#52514e",
+  },
+  rangeBtnActive: {
+    background: "#0C447C",
+    borderColor: "#0C447C",
+    color: "#fff",
+  },
+  chartBlock: { marginBottom: 24 },
+  chartHeaderRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  legendRow: { display: "flex", gap: 14, flexWrap: "wrap" },
+  legendItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12,
+    color: "#52514e",
+  },
+  legendMark: { width: 16, height: 10, borderRadius: 3 },
+  exportBtn: {
+    border: "1px solid #d3d1c7",
+    background: "#fff",
+    borderRadius: 8,
+    padding: "6px 12px",
+    fontSize: 12,
+    cursor: "pointer",
+    color: "#0b0b0b",
+  },
+  whatIfBlock: {
+    border: "1px solid #e1e0d9",
+    borderRadius: 14,
+    padding: "16px 18px",
+    marginBottom: 24,
+  },
+  whatIfHeader: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
+  effectReadout: { fontSize: 13, fontWeight: 600, marginBottom: 14 },
+  slidersRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: 20,
+  },
+  sliderField: {},
+  sliderLabelRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 13,
+    color: "#52514e",
+    marginBottom: 6,
+  },
+  sliderValue: { fontWeight: 500, color: "#0b0b0b" },
+  bottomRow: {
+    display: "grid",
+    gridTemplateColumns: "1.4fr 1fr",
+    gap: 20,
+    marginBottom: 20,
+  },
+  panel: {
+    border: "1px solid #e1e0d9",
+    borderRadius: 14,
+    padding: "16px 18px",
+  },
+  panelTitle: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
+  insulinFormRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
+  insulinList: {
+    display: "flex",
+    gap: 10,
+    flexWrap: "wrap",
+    marginTop: 12,
+    fontSize: 12,
+    color: "#52514e",
+  },
+  insulinListItem: {
+    background: "#F7F0F5",
+    border: "1px solid #E5C7DD",
+    borderRadius: 999,
+    padding: "4px 10px",
+  },
+  nutritionForm: {
+    background: "#F7F6F2",
+    border: "1px solid #e1e0d9",
+    borderRadius: 10,
+    padding: "10px 12px",
+    marginBottom: 14,
+  },
+  nutritionFormRow: { display: "flex", gap: 8, alignItems: "center" },
+  nutritionInput: {
+    width: "100%",
+    padding: "6px 10px",
+    borderRadius: 6,
+    border: "1px solid #d3d1c7",
+    fontSize: 13,
+    boxSizing: "border-box",
+  },
+  nutritionGramsInput: {
+    width: 64,
+    padding: "6px 8px",
+    borderRadius: 6,
+    border: "1px solid #d3d1c7",
+    fontSize: 13,
+  },
+  nutritionAddBtn: {
+    border: "none",
+    background: "#0C447C",
+    color: "#fff",
+    borderRadius: 6,
+    padding: "7px 14px",
+    fontSize: 13,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  nutritionPreview: {
+    marginTop: 8,
+    fontSize: 12,
+    color: "#0F6E56",
+    fontWeight: 500,
+  },
+  suggestList: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    right: 0,
+    background: "#fff",
+    border: "1px solid #d3d1c7",
+    borderRadius: 8,
+    marginTop: 4,
+    zIndex: 5,
+    boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+    maxHeight: 200,
+    overflowY: "auto",
+  },
+  suggestItem: {
+    padding: "8px 12px",
+    fontSize: 13,
+    cursor: "pointer",
+    borderBottom: "1px solid #f1efe8",
+  },
+  suggestEmpty: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    right: 0,
+    background: "#fff",
+    border: "1px solid #d3d1c7",
+    borderRadius: 8,
+    marginTop: 4,
+    padding: "8px 12px",
+    fontSize: 12,
+    color: "#898781",
+    zIndex: 5,
+  },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
+  th: {
+    textAlign: "left",
+    color: "#898781",
+    fontWeight: 500,
+    fontSize: 12,
+    paddingBottom: 8,
+  },
+  td: { padding: "8px 0", borderTop: "1px solid #f1efe8" },
+  matchBadge: {
+    fontSize: 11,
+    padding: "3px 8px",
+    borderRadius: 999,
+    whiteSpace: "nowrap",
+  },
+  statsGrid: { display: "flex", flexDirection: "column", gap: 10 },
+  statRow: { display: "flex", justifyContent: "space-between", fontSize: 13 },
+  footer: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 12,
+    color: "#898781",
+    borderTop: "1px solid #f1efe8",
+    paddingTop: 14,
+  },
+  footerLink: { color: "#185FA5", textDecoration: "none" },
+  formLabel: { fontSize: 13, fontWeight: 500, marginBottom: 6, color: "#52514e" },
+  roleRow: { display: "flex", flexDirection: "column", gap: 8 },
+  radioLabel: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 13,
+    color: "#0b0b0b",
+    cursor: "pointer",
+  },
+};
+
+// ============================================================================
+// Экран регистрации/входа
+// ============================================================================
+
+function RegisterScreen({ onRegistered }) {
+  const [name, setName] = useState("");
+  const [role, setRole] = useState("user");
+  const [hospitalQuery, setHospitalQuery] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const hospitals = useMemo(() => loadHospitals(), []);
+  const hospitalMatches = useMemo(() => {
+    const q = hospitalQuery.trim().toLowerCase();
+    if (q.length < 1) return hospitals.slice(0, 5);
+    return hospitals.filter((h) => h.name.toLowerCase().includes(q)).slice(0, 5);
+  }, [hospitalQuery, hospitals]);
+
+  const isNewHospital =
+    hospitalQuery.trim().length > 0 &&
+    !hospitals.some((h) => h.name.trim().toLowerCase() === hospitalQuery.trim().toLowerCase());
+
+  const handleSubmit = async () => {
+    setError(null);
+    if (!name.trim()) {
+      setError("Введите имя.");
+      return;
+    }
+    if (!hospitalQuery.trim()) {
+      setError("Укажите больницу.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const backendUser = await withRetry(() => registerBackendUser(name.trim()));
+      const hospital = findOrCreateHospital(hospitalQuery);
+      const session = {
+        id: backendUser.ID,
+        name: backendUser.Name,
+        role,
+        hospitalId: hospital.id,
+        hospitalName: hospital.name,
+      };
+      addToDirectory(session);
+      onRegistered(session);
+    } catch (err) {
+      setError(
+        "Не удалось зарегистрироваться — бэкенд недоступен. Проверьте, что сервер запущен и адрес в .env указан верно."
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={styles.page}>
+      <div style={{ ...styles.card, maxWidth: 440 }}>
+        <div style={styles.logo}>
+          <div style={styles.logoMark} />
+          <span style={styles.logoText}>Цифровой двойник гликемии</span>
+        </div>
+
+        <p style={styles.smallMuted}>
+          Регистрация нужна один раз — дальше вход будет запоминаться в этом браузере.
+        </p>
+
+        {error && <div style={styles.errorBanner}>{error}</div>}
+
+        <div style={{ marginTop: 16 }}>
+          <div style={styles.formLabel}>Имя</div>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Например, Мария Иванова"
+            style={styles.nutritionInput}
+          />
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <div style={styles.formLabel}>Роль</div>
+          <div style={styles.roleRow}>
+            <label style={styles.radioLabel}>
+              <input
+                type="radio"
+                checked={role === "user"}
+                onChange={() => setRole("user")}
+              />
+              Пациент — вижу только свои данные
+            </label>
+            <label style={styles.radioLabel}>
+              <input
+                type="radio"
+                checked={role === "admin"}
+                onChange={() => setRole("admin")}
+              />
+              Администратор — вижу всех пациентов больницы
+            </label>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 14, position: "relative" }}>
+          <div style={styles.formLabel}>Больница</div>
+          <input
+            type="text"
+            value={hospitalQuery}
+            onChange={(e) => setHospitalQuery(e.target.value)}
+            placeholder="Начните вводить название"
+            style={styles.nutritionInput}
+          />
+          {hospitalQuery && hospitalMatches.length > 0 && (
+            <div style={styles.suggestList}>
+              {hospitalMatches.map((h) => (
+                <div
+                  key={h.id}
+                  style={styles.suggestItem}
+                  onClick={() => setHospitalQuery(h.name)}
+                >
+                  {h.name}
+                </div>
+              ))}
+            </div>
+          )}
+          {isNewHospital && (
+            <div style={styles.smallMuted}>
+              Такой больницы ещё нет — будет создана новая: «{hospitalQuery.trim()}»
+            </div>
+          )}
+        </div>
+
+        <button
+          style={{ ...styles.nutritionAddBtn, width: "100%", marginTop: 20, padding: "10px 0" }}
+          onClick={handleSubmit}
+          disabled={submitting}
+        >
+          {submitting ? "Регистрируем..." : "Зарегистрироваться"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Корневой компонент — решает, показывать экран регистрации или дашборд
+// ============================================================================
+
+export default function GlucoseDashboardApp() {
+  const [session, setSession] = useState(() => loadSession());
+
+  if (!session) {
+    return (
+      <RegisterScreen
+        onRegistered={(s) => {
+          saveSession(s);
+          setSession(s);
+        }}
+      />
+    );
+  }
+
+  return (
+    <Dashboard
+      session={session}
+      onLogout={() => {
+        clearSession();
+        setSession(null);
+      }}
+    />
+  );
+}
