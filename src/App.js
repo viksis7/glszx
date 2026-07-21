@@ -14,33 +14,26 @@ import {
 } from "recharts";
 
 
+
 const TARGET_RANGE = { low: 3.9, high: 10.0 }; // ммоль/л, из отчета п.1.4
+
 
 const API_BASE = process.env.REACT_APP_API_BASE_URL;
 
 const RANGE_OPTIONS = [
-  { key: "1h", label: "1ч", ms: 1 * 60 * 60 * 1000 },
-  { key: "6h", label: "6ч", ms: 6 * 60 * 60 * 1000 },
-  { key: "24h", label: "24ч", ms: 24 * 60 * 60 * 1000 },
-  { key: "7d", label: "7д", ms: 7 * 24 * 60 * 60 * 1000 },
+  { key: "1h", label: "1ч", period: "1h", ms: 1 * 60 * 60 * 1000 },
+  { key: "6h", label: "6ч", period: "6h", ms: 6 * 60 * 60 * 1000 },
+  { key: "24h", label: "24ч", period: "24h", ms: 24 * 60 * 60 * 1000 },
+  { key: "7d", label: "7д", period: "168h", ms: 7 * 24 * 60 * 60 * 1000 },
+  { key: "all", label: "Всё время", period: "all", ms: Infinity },
 ];
 
-// Две прогнозные модели, которые нужно показывать параллельно.
 const MODELS = {
-  nn: { key: "nn", label: "Нейросеть", color: "#0F6E56" },
-  ode: { key: "ode", label: "ОДУ-модель", color: "#7A3FA0" },
+  nn: { key: "nn", label: "Нейросеть", color: "#0F6E56", staticAccuracy: 92 },
+  ode: { key: "ode", label: "ОДУ-модель", color: "#7A3FA0", staticAccuracy: 87 },
 };
 
-
-
 const LS_SESSION_KEY = "gd_session";
-const LS_DIRECTORY_KEY = "gd_directory"; // все, кто когда-либо регистрировался
-const LS_HOSPITALS_KEY = "gd_hospitals";
-
-function genId() {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
-  return "id-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
 
 function loadJSON(key, fallback) {
   try {
@@ -50,15 +43,13 @@ function loadJSON(key, fallback) {
     return fallback;
   }
 }
-
 function saveJSON(key, value) {
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
-   
+    // localStorage недоступен (приватный режим и т.п.) — молча игнорируем.
   }
 }
-
 function loadSession() {
   return loadJSON(LS_SESSION_KEY, null);
 }
@@ -73,74 +64,108 @@ function clearSession() {
   }
 }
 
-function loadDirectory() {
-  return loadJSON(LS_DIRECTORY_KEY, []);
-}
-function addToDirectory(entry) {
-  const dir = loadDirectory();
-  dir.push(entry);
-  saveJSON(LS_DIRECTORY_KEY, dir);
-  return dir;
+
+function genPatientId() {
+  return 100000 + Math.floor(Math.random() * 900000); // 6 цифр
 }
 
-function loadHospitals() {
-  return loadJSON(LS_HOSPITALS_KEY, []);
-}
-function findOrCreateHospital(name) {
-  const hospitals = loadHospitals();
-  const existing = hospitals.find(
-    (h) => h.name.trim().toLowerCase() === name.trim().toLowerCase()
-  );
-  if (existing) return existing;
-  const created = { id: genId(), name: name.trim() };
-  saveJSON(LS_HOSPITALS_KEY, [...hospitals, created]);
-  return created;
-}
-
-// POST /v1/user — реальный бэкенд-эндпоинт (handlerCreateUser).
-// Тело: { name }. Ответ: { ID, Name } (PascalCase — в User нет json-тегов).
-async function registerBackendUser(name) {
-  const res = await fetch(`${API_BASE}/v1/user`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
-  });
-  if (!res.ok) throw new Error(`network: ${res.status}`);
-  return res.json();
-}
-
-// Glucose/PredictedValue у бэкенда — строки (sqlc мапит NUMERIC/DECIMAL из
+// Glucose/GlucosePredicted у бэкенда — строки (sqlc мапит NUMERIC/DECIMAL из
 // Postgres в string), поэтому всегда парсим через parseFloat.
 function toNum(v) {
   const n = typeof v === "string" ? parseFloat(v) : v;
   return Number.isFinite(n) ? n : null;
 }
 
-// sql.NullFloat64 в Go в зависимости от версии сериализуется в JSON либо как
-// {"Float64":85.2,"Valid":true}, либо (в новых версиях database/sql) просто
-// как число/null. Обрабатываем оба варианта, чтобы не упасть на любой из них.
-function toAccuracy(v) {
-  if (v == null) return null;
-  if (typeof v === "number") return v;
-  if (typeof v === "object" && "Valid" in v) return v.Valid ? v.Float64 : null;
-  return null;
-}
-
-
-async function fetchPatientSnapshot(patientId) {
-  const res = await fetch(`${API_BASE}/v1/glucose_levels`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ patient: patientId }),
-  });
+async function apiFetch(path, options) {
+  const res = await fetch(`${API_BASE}${path}`, options);
   if (!res.ok) throw new Error(`network: ${res.status}`);
   return res.json();
 }
 
-// Вся история измерений пациента (без ограничения по времени — бэкенд отдаёт
-// всё сразу), отсортированная по времени. Фильтрация по выбранному диапазону
-// (1ч/6ч/24ч/7д) делается уже здесь, на фронте.
-function buildFullHistory(readings) {
+// ---- Больницы ----
+// GET /hospitals -> все больницы. GET /hospitals/{name} -> одна по точному
+// названию. POST /hospitals { name } -> создаёт.
+async function fetchAllHospitals() {
+  return apiFetch("/hospitals");
+}
+async function createHospital(name) {
+  return apiFetch("/hospitals", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+}
+// Ищем без учёта регистра среди уже существующих; если не нашли — создаём.
+async function findOrCreateHospital(name) {
+  const hospitals = await fetchAllHospitals();
+  const existing = (hospitals || []).find(
+    (h) => h.Name.trim().toLowerCase() === name.trim().toLowerCase()
+  );
+  if (existing) return existing;
+  return createHospital(name.trim());
+}
+
+
+function toNullUUID(uuidStr) {
+  return uuidStr
+    ? { UUID: uuidStr, Valid: true }
+    : { UUID: "00000000-0000-0000-0000-000000000000", Valid: false };
+}
+function fromNullUUID(value) {
+  if (value == null) return null;
+  if (typeof value === "string") return value; // вдруг это всё же просто строка
+  if (typeof value === "object" && "UUID" in value) return value.Valid ? value.UUID : null;
+  return null;
+}
+
+// ---- Админы ----
+// POST /admin { hospital_id } -> { ID, HospitalID }. GET /admin/{id}.
+async function createAdminUser(hospitalId) {
+  return apiFetch("/admin", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hospital_id: toNullUUID(hospitalId) }),
+  });
+}
+async function fetchAdmin(adminId) {
+  return apiFetch(`/admin/${adminId}`);
+}
+// GET /admin/user/{admin_id} -> все пациенты больницы этого админа.
+async function fetchPatientsForAdmin(adminId) {
+  return apiFetch(`/admin/user/${adminId}`);
+}
+
+// ---- Пациенты ----
+// POST /user { id, name, hospital_id } -> { ID, HospitalID, Name }.
+async function createPatientUser(id, name, hospitalId) {
+  return apiFetch("/user", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, name, hospital_id: toNullUUID(hospitalId) }),
+  });
+}
+async function fetchPatientUser(patientId) {
+  return apiFetch(`/user/${patientId}`);
+}
+
+// Определяет по названию больницы, к которой привязан hospitalId — нужно
+// только для отображения имени в шапке после входа по ID.
+async function resolveHospitalName(hospitalIdRaw) {
+  const hospitalId = fromNullUUID(hospitalIdRaw);
+  if (!hospitalId) return null;
+  const hospitals = await fetchAllHospitals();
+  const found = (hospitals || []).find((h) => h.ID === hospitalId);
+  return found ? found.Name : null;
+}
+
+
+async function fetchPatientSnapshot(patientId, period) {
+  return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
+}
+
+// Вся история измерений пациента за выбранный период (период теперь
+// применяется на СЕРВЕРЕ, не на фронте, как было раньше).
+function buildHistory(readings) {
   return [...(readings || [])]
     .map((r) => ({
       t: new Date(r.TimeOfReading).getTime(),
@@ -150,33 +175,26 @@ function buildFullHistory(readings) {
     .sort((a, b) => a.t - b.t);
 }
 
-function filterHistoryByRange(fullHistory, rangeKey) {
-  const cfg = RANGE_OPTIONS.find((r) => r.key === rangeKey) || RANGE_OPTIONS[2];
-  const cutoff = Date.now() - cfg.ms;
-  return fullHistory.filter((d) => d.t >= cutoff);
-}
-
-
 function buildFutureForecastRows(modelPredictions, oduPredictions) {
   const map = new Map();
   (modelPredictions || []).forEach((p) => {
     const t = new Date(p.TimePredicted).getTime();
     const entry = map.get(t) || { t };
-    entry.forecastNN = toNum(p.PredictedValue);
+    entry.forecastNN = toNum(p.GlucosePredicted);
     map.set(t, entry);
   });
   (oduPredictions || []).forEach((p) => {
     const t = new Date(p.TimePredicted).getTime();
     const entry = map.get(t) || { t };
-    entry.forecastODE = toNum(p.PredictedValue);
+    entry.forecastODE = toNum(p.GlucosePredicted);
     map.set(t, entry);
   });
   return Array.from(map.values()).sort((a, b) => a.t - b.t);
 }
 
-function latestReadingFrom(fullHistory) {
-  if (fullHistory.length === 0) return null;
-  const last = fullHistory[fullHistory.length - 1];
+function latestReadingFrom(history) {
+  if (history.length === 0) return null;
+  const last = history[history.length - 1];
   if (last.actual == null) return null;
   return {
     value: last.actual,
@@ -185,20 +203,17 @@ function latestReadingFrom(fullHistory) {
   };
 }
 
-function latestForecastFrom(predictions, modelVersionFallback) {
+// Версии моделей и точность бэкенд больше не отдаёт — карточка прогноза
+// показывает только значение и время, без "версии"/"точности".
+function latestForecastFrom(predictions) {
   const sorted = [...(predictions || [])].sort(
     (a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted)
   );
   if (sorted.length === 0) return null;
   const next = sorted[0];
-  const value = toNum(next.PredictedValue);
+  const value = toNum(next.GlucosePredicted);
   if (value == null) return null;
-  return {
-    value,
-    forecastFor: next.TimePredicted,
-    modelVersion: next.ModelVersion || modelVersionFallback,
-    accuracy: toAccuracy(next.Accuracy) ?? 0,
-  };
+  return { value, forecastFor: next.TimePredicted };
 }
 
 // Статистика считается на фронте из уже полученной истории — отдельного
@@ -220,7 +235,11 @@ function computeStats(historyRows) {
   };
 }
 
+// --- Дальше — то, под что на бэкенде пока нет эндпоинтов, оставлено моком ---
 
+// Локальная база продуктов для автоподбора КБЖУ (только фронт — для
+// демонстрации/защиты; реального бэкенд-эндпоинта под это пока нет).
+// Значения — на 100 г продукта.
 const FOOD_DATABASE = [
   { name: "Овсянка на воде", calories: 88, protein: 3, fat: 1.7, carbs: 15 },
   { name: "Гречка варёная", calories: 110, protein: 4, fat: 1.1, carbs: 21 },
@@ -289,13 +308,7 @@ async function fetchNutritionLog(patientId) {
   ];
 }
 
-// POST /api/patients/{id}/forecast/what-if  { carbsG, proteinG, activityMin }
-// (пока не реализовано на бэкенде — считается локально на фронте).
-// Возвращает проекцию В БУДУЩЕЕ от последней известной точки истории —
-// именно так сценарий "что если" показан на макете (линия продолжает
-// график вперёд, а не накладывается на уже прошедшие данные). Эффект
-// применяется резко в первые же шаги, чтобы изменение сразу бросалось
-// в глаза, а не терялось в плавном нарастании.
+
 async function fetchWhatIfForecast(patientId, params, baseHistory) {
   await delay(350);
   if (baseHistory.length === 0) return { points: [], netEffect: 0 };
@@ -314,9 +327,7 @@ async function fetchWhatIfForecast(patientId, params, baseHistory) {
       ? last.t - baseHistory[baseHistory.length - 2].t
       : 30 * 60000;
 
-  const horizon = 8; // на сколько шагов вперёд строим сценарий
-  // Доля общего эффекта, применяемая на каждом шаге: основной скачок сразу
-  // на первых 2 шагах, дальше — плавный хвост.
+  const horizon = 8; 
   const stepWeights = [0.4, 0.7, 0.85, 0.93, 0.97, 0.99, 1, 1];
   const points = [{ t: last.t, whatIf: last.actual }]; // точка стыковки с фактом
   for (let i = 0; i < horizon; i++) {
@@ -343,11 +354,6 @@ function classify(value) {
   return "normal";
 }
 
-// Общие, широко распространённые рекомендации (по типу "правила 15-15" от
-// диабетических ассоциаций). Это НЕ медицинское назначение — конкретные
-// пороги и действия для конкретного пациента должен определять его врач.
-// Если у пациента есть индивидуальный план — эти тексты нужно заменить на
-// него (см. поле patient.carePlan, если оно появится в реальном API).
 function getGlucoseTips(value, status) {
   if (status === "hypo") {
     if (value < 3.0) {
@@ -432,7 +438,7 @@ function nearestActualValue(historyRows, t) {
 
 function formatTime(iso, rangeKey) {
   const d = new Date(iso);
-  if (rangeKey === "7d") {
+  if (rangeKey === "7d" || rangeKey === "all") {
     return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
   }
   return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
@@ -469,20 +475,35 @@ function downloadCsv(history, patientName) {
 // ============================================================================
 
 function Dashboard({ session, onLogout }) {
-  // Список пациентов зависит от роли: админ видит всех пациентов своей
-  // больницы (из локального справочника), обычный пользователь — только себя.
-  const patients = useMemo(() => {
-    if (session.role === "admin") {
-      const dir = loadDirectory();
-      const own = dir.filter(
-        (u) => u.hospitalId === session.hospitalId && u.role === "user"
-      );
-      return own.length > 0 ? own : [{ id: session.id, name: session.name }];
-    }
-    return [{ id: session.id, name: session.name }];
+  // Список пациентов зависит от роли: админ получает реальный список через
+  // GET /admin/user/{admin_id}, обычный пользователь — только себя.
+  const [patients, setPatients] = useState(
+    session.role === "user" ? [{ id: session.id, name: session.name }] : []
+  );
+  const [patientsLoaded, setPatientsLoaded] = useState(session.role === "user");
+
+  useEffect(() => {
+    if (session.role !== "admin") return;
+    let cancelled = false;
+    fetchPatientsForAdmin(session.id)
+      .then((users) => {
+        if (cancelled) return;
+        setPatients((users || []).map((u) => ({ id: u.ID, name: u.Name })));
+        setPatientsLoaded(true);
+      })
+      .catch(() => {
+        if (!cancelled) setPatientsLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [session]);
 
-  const [patientId, setPatientId] = useState(patients[0].id);
+  const [patientId, setPatientId] = useState(null);
+  useEffect(() => {
+    if (patientId == null && patients.length > 0) setPatientId(patients[0].id);
+  }, [patients, patientId]);
+
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
 
@@ -498,27 +519,18 @@ function Dashboard({ session, onLogout }) {
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
-  const patient = patients.find((p) => p.id === patientId) || patients[0];
+  const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
   const pollRef = useRef(null);
 
-  // Вся история пациента (без ограничения по времени — бэкенд отдаёт всё сразу).
-  const fullHistory = useMemo(
-    () => buildFullHistory(snapshot?.readings),
-    [snapshot]
-  );
-  // История, отфильтрованная под выбранный диапазон (1ч/6ч/24ч/7д) — фильтр
-  // чисто клиентский, новый запрос на бэкенд при смене диапазона не нужен.
-  const history = useMemo(
-    () => filterHistoryByRange(fullHistory, rangeKey),
-    [fullHistory, rangeKey]
-  );
-  const latest = useMemo(() => latestReadingFrom(fullHistory), [fullHistory]);
+  // История за выбранный период — период теперь применяется на СЕРВЕРЕ.
+  const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
+  const latest = useMemo(() => latestReadingFrom(history), [history]);
   const forecastNN = useMemo(
-    () => latestForecastFrom(snapshot?.model_predictions, "nn"),
+    () => latestForecastFrom(snapshot?.model_predictions),
     [snapshot]
   );
   const forecastODE = useMemo(
-    () => latestForecastFrom(snapshot?.odu_predictions, "ode"),
+    () => latestForecastFrom(snapshot?.odu_predictions),
     [snapshot]
   );
   const futureForecastRows = useMemo(
@@ -527,10 +539,33 @@ function Dashboard({ session, onLogout }) {
   );
   const stats = useMemo(() => computeStats(history), [history]);
 
+  const [fullSnapshot, setFullSnapshot] = useState(null);
+  useEffect(() => {
+    if (!patientId) return;
+    let cancelled = false;
+    fetchPatientSnapshot(patientId, "all")
+      .then((res) => {
+        if (!cancelled) setFullSnapshot(res);
+      })
+      .catch(() => {
+        // "Вся история" необязательна для основного дашборда — тихо игнорируем
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [patientId]);
+  const fullHistory = useMemo(() => buildHistory(fullSnapshot?.readings), [fullSnapshot]);
+
+  const currentPeriod = RANGE_OPTIONS.find((r) => r.key === rangeKey)?.period || "24h";
+
   const loadAll = useCallback(async () => {
+    if (!patientId) {
+      setLoading(false);
+      return;
+    }
     try {
       const [snapshotRes, nutritionRes] = await Promise.all([
-        withRetry(() => fetchPatientSnapshot(patientId)),
+        withRetry(() => fetchPatientSnapshot(patientId, currentPeriod)),
         withRetry(() => fetchNutritionLog(patientId)),
       ]);
       setSnapshot(snapshotRes);
@@ -543,19 +578,19 @@ function Dashboard({ session, onLogout }) {
     } finally {
       setLoading(false);
     }
-  }, [patientId]);
+  }, [patientId, currentPeriod]);
 
   useEffect(() => {
     setLoading(true);
     loadAll();
   }, [loadAll]);
 
-  // Автообновление — п.1.6 отчета: каждые 30 секунд перезапрашиваем снапшот
-  // целиком (бэкенд отдаёт всё одним запросом, отдельного "latest" эндпоинта нет).
+  // Автообновление — каждые 30 секунд перезапрашиваем снапшот для того же периода.
   useEffect(() => {
     pollRef.current = setInterval(async () => {
+      if (!patientId) return;
       try {
-        const snapshotRes = await fetchPatientSnapshot(patientId);
+        const snapshotRes = await fetchPatientSnapshot(patientId, currentPeriod);
         setSnapshot(snapshotRes);
         setConnected(true);
       } catch {
@@ -563,7 +598,7 @@ function Dashboard({ session, onLogout }) {
       }
     }, 30000);
     return () => clearInterval(pollRef.current);
-  }, [patientId]);
+  }, [patientId, currentPeriod]);
 
   const runWhatIf = useCallback(
     async (params) => {
@@ -687,6 +722,18 @@ function Dashboard({ session, onLogout }) {
           onLogout={onLogout}
         />
 
+        {!patientsLoaded ? (
+          <div style={styles.emptyState}>Загружаем список пациентов…</div>
+        ) : !patient ? (
+          <div style={styles.emptyState}>
+            В больнице «{session.hospitalName}» пока нет ни одного
+            зарегистрированного пациента. Как только кто-то зарегистрируется с
+            ролью «Пациент» и укажет эту же больницу, он появится в списке
+            здесь.
+          </div>
+        ) : (
+          <>
+
         {error && (
           <div style={styles.errorBanner}>
             <span>{error}</span>
@@ -739,6 +786,13 @@ function Dashboard({ session, onLogout }) {
           <Statistics stats={stats} loading={loading} />
         </div>
 
+        <FullHistoryTable
+          history={fullHistory}
+          onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
+        />
+          </>
+        )}
+
         <Footer />
       </div>
     </div>
@@ -762,25 +816,30 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
             {session.role === "admin" ? "Администратор" : "Пациент"}
           </span>
           <span style={styles.smallMuted}>{session.hospitalName}</span>
+          <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
             Пациент:
-            <select
-              value={patient.id}
-              onChange={(e) => onPatientChange(e.target.value)}
-              style={styles.select}
-            >
-              {patients.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
+            {patients.length === 0 ? (
+              <span style={styles.smallMuted}> нет пациентов</span>
+            ) : (
+              <select
+                value={patient?.id ?? ""}
+                onChange={(e) => onPatientChange(e.target.value)}
+                style={styles.select}
+              >
+                {patients.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
         ) : (
-          <span style={styles.patientLabel}>{patient.name}</span>
+          <span style={styles.patientLabel}>{patient?.name}</span>
         )}
 
         <div style={styles.connectionIndicator}>
@@ -883,10 +942,12 @@ function ForecastCard({ model, forecast, loading }) {
               hour: "2-digit",
               minute: "2-digit",
             })}
-            {" · "}
-            {forecast.modelVersion}
             {" · точность "}
-            {Math.round(forecast.accuracy * 100)}%
+            {model.staticAccuracy}%
+            <span title="Бэкенд пока не отдаёт реальную точность модели — значение для вида.">
+              {" "}
+              *
+            </span>
           </div>
         </>
       )}
@@ -1402,6 +1463,72 @@ function StatRow({ label, value }) {
   );
 }
 
+function FullHistoryTable({ history, onExport }) {
+  const [open, setOpen] = useState(false);
+  const sorted = useMemo(() => [...history].sort((a, b) => b.t - a.t), [history]);
+
+  return (
+    <div style={styles.panel}>
+      <div style={styles.historyHeaderRow}>
+        <button style={styles.historyToggleBtn} onClick={() => setOpen((v) => !v)}>
+          {open ? "▾" : "▸"} История измерений за выбранный период ({history.length})
+          — выбери «Всё время» вверху, чтобы увидеть все измерения
+        </button>
+        <button style={styles.exportBtn} onClick={onExport}>
+          Экспорт в CSV
+        </button>
+      </div>
+      {open && (
+        <div style={styles.historyScroll}>
+          {sorted.length === 0 ? (
+            <div style={styles.smallMuted}>Измерений пока нет.</div>
+          ) : (
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>Дата</th>
+                  <th style={styles.th}>Время</th>
+                  <th style={styles.th}>Глюкоза</th>
+                  <th style={styles.th}>Статус</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((d) => {
+                  const dt = new Date(d.t);
+                  const status = d.actual != null ? classify(d.actual) : null;
+                  const meta = status ? STATUS_META[status] : null;
+                  return (
+                    <tr key={d.t}>
+                      <td style={styles.td}>
+                        {dt.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}
+                      </td>
+                      <td style={styles.td}>
+                        {dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}
+                      </td>
+                      <td style={styles.td}>
+                        {d.actual != null ? `${d.actual} ммоль/л` : "—"}
+                      </td>
+                      <td style={styles.td}>
+                        {meta && (
+                          <span
+                            style={{ ...styles.badge, color: meta.color, background: meta.bg }}
+                          >
+                            {meta.label}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Footer() {
   return (
     <div style={styles.footer}>
@@ -1520,6 +1647,15 @@ const styles = {
     padding: "3px 10px",
     fontSize: 12,
     cursor: "pointer",
+  },
+  emptyState: {
+    background: "#F7F6F2",
+    border: "1px dashed #c3c2b7",
+    borderRadius: 10,
+    padding: "20px 16px",
+    fontSize: 13,
+    color: "#52514e",
+    textAlign: "center",
   },
   errorBanner: {
     display: "flex",
@@ -1658,6 +1794,30 @@ const styles = {
     padding: "16px 18px",
   },
   panelTitle: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
+  historyHeaderRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  historyToggleBtn: {
+    border: "none",
+    background: "transparent",
+    fontSize: 14,
+    fontWeight: 500,
+    cursor: "pointer",
+    color: "#0b0b0b",
+    padding: 0,
+  },
+  historyScroll: {
+    marginTop: 14,
+    maxHeight: 320,
+    overflowY: "auto",
+    border: "1px solid #f1efe8",
+    borderRadius: 8,
+    padding: "0 12px",
+  },
   insulinFormRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
   insulinList: {
     display: "flex",
@@ -1773,6 +1933,70 @@ const styles = {
   },
   footerLink: { color: "#185FA5", textDecoration: "none" },
   formLabel: { fontSize: 13, fontWeight: 500, marginBottom: 6, color: "#52514e" },
+  authTabsRow: {
+    display: "flex",
+    gap: 4,
+    marginTop: 16,
+    marginBottom: 12,
+    background: "#F1EFE8",
+    borderRadius: 10,
+    padding: 4,
+  },
+  authTab: {
+    flex: 1,
+    border: "none",
+    background: "transparent",
+    borderRadius: 8,
+    padding: "8px 0",
+    fontSize: 13,
+    cursor: "pointer",
+    color: "#52514e",
+  },
+  authTabActive: {
+    background: "#fff",
+    color: "#0b0b0b",
+    fontWeight: 500,
+    boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
+  },
+  accountList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    marginTop: 14,
+  },
+  accountItem: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: 2,
+    textAlign: "left",
+    border: "1px solid #d3d1c7",
+    borderRadius: 10,
+    padding: "10px 14px",
+    background: "#fff",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  accountId: {
+    fontSize: 11,
+    color: "#898781",
+    fontFamily: "monospace",
+    marginTop: 2,
+    wordBreak: "break-all",
+  },
+  loginIdDisplay: {
+    fontFamily: "monospace",
+    fontSize: 20,
+    fontWeight: 600,
+    background: "#F1EFE8",
+    border: "1px dashed #c3c2b7",
+    borderRadius: 10,
+    padding: "12px 16px",
+    marginTop: 6,
+    marginBottom: 10,
+    textAlign: "center",
+    wordBreak: "break-all",
+  },
   roleRow: { display: "flex", flexDirection: "column", gap: 8 },
   radioLabel: {
     display: "flex",
@@ -1789,26 +2013,60 @@ const styles = {
 // ============================================================================
 
 function RegisterScreen({ onRegistered }) {
+  const [mode, setMode] = useState("register"); // "register" | "login"
   const [name, setName] = useState("");
   const [role, setRole] = useState("user");
   const [hospitalQuery, setHospitalQuery] = useState("");
+  const [hospitalMatches, setHospitalMatches] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [loginIdInput, setLoginIdInput] = useState("");
+  // После успешной регистрации сперва показываем ID для входа, и только
+  // по нажатию "Продолжить" переходим в сам дашборд — иначе пользователь
+  // рискует не заметить/не сохранить свой ID.
+  const [justRegistered, setJustRegistered] = useState(null);
 
-  const hospitals = useMemo(() => loadHospitals(), []);
-  const hospitalMatches = useMemo(() => {
-    const q = hospitalQuery.trim().toLowerCase();
-    if (q.length < 1) return hospitals.slice(0, 5);
-    return hospitals.filter((h) => h.name.toLowerCase().includes(q)).slice(0, 5);
-  }, [hospitalQuery, hospitals]);
+  const [hasExactHospitalMatch, setHasExactHospitalMatch] = useState(false);
 
-  const isNewHospital =
-    hospitalQuery.trim().length > 0 &&
-    !hospitals.some((h) => h.name.trim().toLowerCase() === hospitalQuery.trim().toLowerCase());
+  // Автодополнение больниц теперь бьёт в реальный GET /hospitals с debounce.
+  useEffect(() => {
+    const q = hospitalQuery.trim();
+    if (q.length < 1) {
+      setHospitalMatches([]);
+      setHasExactHospitalMatch(false);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      fetchAllHospitals()
+        .then((all) => {
+          if (cancelled) return;
+          const filtered = (all || []).filter((h) =>
+            h.Name.toLowerCase().includes(q.toLowerCase())
+          );
+          setHospitalMatches(filtered.slice(0, 5));
+          setHasExactHospitalMatch(
+            filtered.some((h) => h.Name.trim().toLowerCase() === q.toLowerCase())
+          );
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setHospitalMatches([]);
+            setHasExactHospitalMatch(false);
+          }
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [hospitalQuery]);
 
-  const handleSubmit = async () => {
+  const isNewHospital = hospitalQuery.trim().length > 0 && !hasExactHospitalMatch;
+
+  const handleRegister = async () => {
     setError(null);
-    if (!name.trim()) {
+    if (role === "user" && !name.trim()) {
       setError("Введите имя.");
       return;
     }
@@ -1818,17 +2076,43 @@ function RegisterScreen({ onRegistered }) {
     }
     setSubmitting(true);
     try {
-      const backendUser = await withRetry(() => registerBackendUser(name.trim()));
-      const hospital = findOrCreateHospital(hospitalQuery);
-      const session = {
-        id: backendUser.ID,
-        name: backendUser.Name,
-        role,
-        hospitalId: hospital.id,
-        hospitalName: hospital.name,
-      };
-      addToDirectory(session);
-      onRegistered(session);
+      const hospital = await withRetry(() => findOrCreateHospital(hospitalQuery));
+      let session;
+      if (role === "admin") {
+        const admin = await withRetry(() => createAdminUser(hospital.ID));
+        session = {
+          id: admin.ID,
+          loginId: admin.ID,
+          name: null,
+          role: "admin",
+          hospitalId: hospital.ID,
+          hospitalName: hospital.Name,
+        };
+      } else {
+        // Пациент сам придумывает себе ID (бэкенд не генерирует его сам).
+        // При коллизии с уже занятым ID сервер ответит ошибкой — тогда
+        // просто пробуем ещё раз с новым случайным ID.
+        let created = null;
+        let lastErr = null;
+        for (let attempt = 0; attempt < 3 && !created; attempt++) {
+          try {
+            const id = genPatientId();
+            created = await createPatientUser(id, name.trim(), hospital.ID);
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (!created) throw lastErr || new Error("network");
+        session = {
+          id: created.ID,
+          loginId: created.ID,
+          name: created.Name,
+          role: "user",
+          hospitalId: hospital.ID,
+          hospitalName: hospital.Name,
+        };
+      }
+      setJustRegistered(session);
     } catch (err) {
       setError(
         "Не удалось зарегистрироваться — бэкенд недоступен. Проверьте, что сервер запущен и адрес в .env указан верно."
@@ -1838,6 +2122,81 @@ function RegisterScreen({ onRegistered }) {
     }
   };
 
+  const handleLoginSubmit = async () => {
+    setError(null);
+    const raw = loginIdInput.trim();
+    if (!raw) {
+      setError("Введите ID.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (/^\d+$/.test(raw)) {
+        // Числовой ID — это пациент.
+        const user = await fetchPatientUser(raw);
+        const hospitalName = await resolveHospitalName(user.HospitalID);
+        onRegistered({
+          id: user.ID,
+          loginId: user.ID,
+          name: user.Name,
+          role: "user",
+          hospitalId: fromNullUUID(user.HospitalID),
+          hospitalName: hospitalName || "—",
+        });
+      } else {
+        // Иначе пробуем как UUID администратора.
+        const admin = await fetchAdmin(raw);
+        const hospitalName = await resolveHospitalName(admin.HospitalID);
+        onRegistered({
+          id: admin.ID,
+          loginId: admin.ID,
+          name: null,
+          role: "admin",
+          hospitalId: fromNullUUID(admin.HospitalID),
+          hospitalName: hospitalName || "—",
+        });
+      }
+    } catch (err) {
+      setError("Пользователь с таким ID не найден.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Экран "вот твой ID, сохрани его" сразу после регистрации.
+  if (justRegistered) {
+    return (
+      <div style={styles.page}>
+        <div style={{ ...styles.card, maxWidth: 440 }}>
+          <div style={styles.logo}>
+            <div style={styles.logoMark} />
+            <span style={styles.logoText}>Цифровой двойник гликемии</span>
+          </div>
+          <p style={styles.smallMuted}>Регистрация прошла успешно.</p>
+          <div style={styles.formLabel}>
+            {justRegistered.role === "admin" ? "Ваш ID администратора" : "Ваш ID пациента"}
+          </div>
+          <div style={styles.loginIdDisplay}>{justRegistered.loginId}</div>
+          <p style={styles.smallMuted}>
+            Сохраните этот ID — он понадобится, чтобы войти в следующий раз (на
+            вкладке «Войти»).
+          </p>
+          <button
+            style={{
+              ...styles.nutritionAddBtn,
+              width: "100%",
+              marginTop: 20,
+              padding: "10px 0",
+            }}
+            onClick={() => onRegistered(justRegistered)}
+          >
+            Продолжить
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={styles.page}>
       <div style={{ ...styles.card, maxWidth: 440 }}>
@@ -1846,81 +2205,149 @@ function RegisterScreen({ onRegistered }) {
           <span style={styles.logoText}>Цифровой двойник гликемии</span>
         </div>
 
-        <p style={styles.smallMuted}>
-          Регистрация нужна один раз — дальше вход будет запоминаться в этом браузере.
-        </p>
+        <div style={styles.authTabsRow}>
+          <button
+            style={{
+              ...styles.authTab,
+              ...(mode === "register" ? styles.authTabActive : {}),
+            }}
+            onClick={() => {
+              setMode("register");
+              setError(null);
+            }}
+          >
+            Зарегистрироваться
+          </button>
+          <button
+            style={{
+              ...styles.authTab,
+              ...(mode === "login" ? styles.authTabActive : {}),
+            }}
+            onClick={() => {
+              setMode("login");
+              setError(null);
+            }}
+          >
+            Войти
+          </button>
+        </div>
 
         {error && <div style={styles.errorBanner}>{error}</div>}
 
-        <div style={{ marginTop: 16 }}>
-          <div style={styles.formLabel}>Имя</div>
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Например, Мария Иванова"
-            style={styles.nutritionInput}
-          />
-        </div>
-
-        <div style={{ marginTop: 14 }}>
-          <div style={styles.formLabel}>Роль</div>
-          <div style={styles.roleRow}>
-            <label style={styles.radioLabel}>
+        {mode === "login" ? (
+          <>
+            <p style={styles.smallMuted}>
+              Пациенты входят по короткому числовому ID, администраторы — по
+              своему UUID. Оба выдаются один раз при регистрации.
+            </p>
+            <div style={{ marginTop: 12 }}>
+              <div style={styles.formLabel}>Ваш ID</div>
               <input
-                type="radio"
-                checked={role === "user"}
-                onChange={() => setRole("user")}
+                type="text"
+                value={loginIdInput}
+                onChange={(e) => setLoginIdInput(e.target.value)}
+                placeholder="Например, 482913 или UUID"
+                style={styles.nutritionInput}
               />
-              Пациент — вижу только свои данные
-            </label>
-            <label style={styles.radioLabel}>
-              <input
-                type="radio"
-                checked={role === "admin"}
-                onChange={() => setRole("admin")}
-              />
-              Администратор — вижу всех пациентов больницы
-            </label>
-          </div>
-        </div>
+            </div>
+            <button
+              style={{
+                ...styles.nutritionAddBtn,
+                width: "100%",
+                marginTop: 16,
+                padding: "10px 0",
+              }}
+              onClick={handleLoginSubmit}
+            >
+              Войти
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={styles.smallMuted}>
+              Регистрация нужна один раз — дальше вход будет запоминаться в этом
+              браузере (или заходи через вкладку «Войти»).
+            </p>
 
-        <div style={{ marginTop: 14, position: "relative" }}>
-          <div style={styles.formLabel}>Больница</div>
-          <input
-            type="text"
-            value={hospitalQuery}
-            onChange={(e) => setHospitalQuery(e.target.value)}
-            placeholder="Начните вводить название"
-            style={styles.nutritionInput}
-          />
-          {hospitalQuery && hospitalMatches.length > 0 && (
-            <div style={styles.suggestList}>
-              {hospitalMatches.map((h) => (
-                <div
-                  key={h.id}
-                  style={styles.suggestItem}
-                  onClick={() => setHospitalQuery(h.name)}
-                >
-                  {h.name}
+            {role === "user" && (
+              <div style={{ marginTop: 16 }}>
+                <div style={styles.formLabel}>Имя</div>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Например, Мария Иванова"
+                  style={styles.nutritionInput}
+                />
+              </div>
+            )}
+
+            <div style={{ marginTop: 14 }}>
+              <div style={styles.formLabel}>Роль</div>
+              <div style={styles.roleRow}>
+                <label style={styles.radioLabel}>
+                  <input
+                    type="radio"
+                    checked={role === "user"}
+                    onChange={() => setRole("user")}
+                  />
+                  Пациент 
+                </label>
+                <label style={styles.radioLabel}>
+                  <input
+                    type="radio"
+                    checked={role === "admin"}
+                    onChange={() => setRole("admin")}
+                  />
+                  Администратор
+                </label>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14, position: "relative" }}>
+              <div style={styles.formLabel}>Больница</div>
+              <input
+                type="text"
+                value={hospitalQuery}
+                onChange={(e) => setHospitalQuery(e.target.value)}
+                placeholder="Начните вводить название"
+                style={styles.nutritionInput}
+              />
+              {hospitalQuery && hospitalMatches.length > 0 && (
+                <div style={styles.suggestList}>
+                  {hospitalMatches.map((h) => (
+                    <div
+                      key={h.ID}
+                      style={styles.suggestItem}
+                      onClick={() => setHospitalQuery(h.Name)}
+                    >
+                      {h.Name}
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
+              {isNewHospital && (
+                <div style={styles.smallMuted}>
+                  Такой больницы ещё нет — будет создана новая: «
+                  {hospitalQuery.trim()}»
+                </div>
+              )}
             </div>
-          )}
-          {isNewHospital && (
-            <div style={styles.smallMuted}>
-              Такой больницы ещё нет — будет создана новая: «{hospitalQuery.trim()}»
-            </div>
-          )}
-        </div>
 
-        <button
-          style={{ ...styles.nutritionAddBtn, width: "100%", marginTop: 20, padding: "10px 0" }}
-          onClick={handleSubmit}
-          disabled={submitting}
-        >
-          {submitting ? "Регистрируем..." : "Зарегистрироваться"}
-        </button>
+            <button
+              style={{
+                ...styles.nutritionAddBtn,
+                width: "100%",
+                marginTop: 20,
+                padding: "10px 0",
+              }}
+              onClick={handleRegister}
+              disabled={submitting}
+            >
+              {submitting ? "Регистрируем..." : "Зарегистрироваться"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
