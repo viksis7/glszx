@@ -460,7 +460,7 @@ const [patientId, setPatientId] = useState(null);
     if (patients.length > 0 && patientId === null) {
       setPatientId(patients[0].id);
     }
-  }, [patients]);  // ← убрали patientId из зависимостей
+  }, [patients]);  
 
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
@@ -569,10 +569,9 @@ const [patientId, setPatientId] = useState(null);
   );
 
   useEffect(() => {
-    const t = setTimeout(() => runWhatIf(whatIf), 250);
+    const t = setTimeout(() => runWhatIf(whatIf), 250); 
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [whatIf, history]);
+  }, [whatIf, history, runWhatIf]);
 
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
