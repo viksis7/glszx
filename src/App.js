@@ -10,13 +10,9 @@ import {
   ResponsiveContainer,
   ReferenceArea,
   ReferenceLine,
-  Scatter,
 } from "recharts";
 
-
-
 const TARGET_RANGE = { low: 3.9, high: 10.0 }; // ммоль/л, из отчета п.1.4
-
 
 const API_BASE = process.env.REACT_APP_API_BASE_URL;
 
@@ -64,7 +60,6 @@ function clearSession() {
   }
 }
 
-
 function genPatientId() {
   return 100000 + Math.floor(Math.random() * 900000); // 6 цифр
 }
@@ -83,8 +78,6 @@ async function apiFetch(path, options) {
 }
 
 // ---- Больницы ----
-// GET /hospitals -> все больницы. GET /hospitals/{name} -> одна по точному
-// названию. POST /hospitals { name } -> создаёт.
 async function fetchAllHospitals() {
   return apiFetch("/hospitals");
 }
@@ -95,7 +88,6 @@ async function createHospital(name) {
     body: JSON.stringify({ name }),
   });
 }
-// Ищем без учёта регистра среди уже существующих; если не нашли — создаём.
 async function findOrCreateHospital(name) {
   const hospitals = await fetchAllHospitals();
   const existing = (hospitals || []).find(
@@ -105,7 +97,6 @@ async function findOrCreateHospital(name) {
   return createHospital(name.trim());
 }
 
-
 function toNullUUID(uuidStr) {
   return uuidStr
     ? { UUID: uuidStr, Valid: true }
@@ -113,13 +104,12 @@ function toNullUUID(uuidStr) {
 }
 function fromNullUUID(value) {
   if (value == null) return null;
-  if (typeof value === "string") return value; // вдруг это всё же просто строка
+  if (typeof value === "string") return value;
   if (typeof value === "object" && "UUID" in value) return value.Valid ? value.UUID : null;
   return null;
 }
 
 // ---- Админы ----
-// POST /admin { hospital_id } -> { ID, HospitalID }. GET /admin/{id}.
 async function createAdminUser(hospitalId) {
   return apiFetch("/admin", {
     method: "POST",
@@ -130,13 +120,11 @@ async function createAdminUser(hospitalId) {
 async function fetchAdmin(adminId) {
   return apiFetch(`/admin/${adminId}`);
 }
-// GET /admin/user/{admin_id} -> все пациенты больницы этого админа.
 async function fetchPatientsForAdmin(adminId) {
   return apiFetch(`/admin/user/${adminId}`);
 }
 
 // ---- Пациенты ----
-// POST /user { id, name, hospital_id } -> { ID, HospitalID, Name }.
 async function createPatientUser(id, name, hospitalId) {
   return apiFetch("/user", {
     method: "POST",
@@ -148,8 +136,6 @@ async function fetchPatientUser(patientId) {
   return apiFetch(`/user/${patientId}`);
 }
 
-// Определяет по названию больницы, к которой привязан hospitalId — нужно
-// только для отображения имени в шапке после входа по ID.
 async function resolveHospitalName(hospitalIdRaw) {
   const hospitalId = fromNullUUID(hospitalIdRaw);
   if (!hospitalId) return null;
@@ -158,13 +144,10 @@ async function resolveHospitalName(hospitalIdRaw) {
   return found ? found.Name : null;
 }
 
-
 async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
 }
 
-// Вся история измерений пациента за выбранный период (период теперь
-// применяется на СЕРВЕРЕ, не на фронте, как было раньше).
 function buildHistory(readings) {
   return [...(readings || [])]
     .map((r) => ({
@@ -203,8 +186,6 @@ function latestReadingFrom(history) {
   };
 }
 
-// Версии моделей и точность бэкенд больше не отдаёт — карточка прогноза
-// показывает только значение и время, без "версии"/"точности".
 function latestForecastFrom(predictions) {
   const sorted = [...(predictions || [])].sort(
     (a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted)
@@ -216,8 +197,6 @@ function latestForecastFrom(predictions) {
   return { value, forecastFor: next.TimePredicted };
 }
 
-// Статистика считается на фронте из уже полученной истории — отдельного
-// эндпоинта под неё на бэкенде пока нет.
 function computeStats(historyRows) {
   const values = historyRows.map((d) => d.actual).filter((v) => v != null);
   if (values.length === 0) return { average: 0, min: 0, max: 0, timeInRange: 0 };
@@ -235,11 +214,7 @@ function computeStats(historyRows) {
   };
 }
 
-// --- Дальше — то, под что на бэкенде пока нет эндпоинтов, оставлено моком ---
-
-// Локальная база продуктов для автоподбора КБЖУ (только фронт — для
-// демонстрации/защиты; реального бэкенд-эндпоинта под это пока нет).
-// Значения — на 100 г продукта.
+// --- База продуктов (локально) ---
 const FOOD_DATABASE = [
   { name: "Овсянка на воде", calories: 88, protein: 3, fat: 1.7, carbs: 15 },
   { name: "Гречка варёная", calories: 110, protein: 4, fat: 1.1, carbs: 21 },
@@ -269,7 +244,6 @@ function findFoodMatches(query) {
   return FOOD_DATABASE.filter((f) => f.name.toLowerCase().includes(q)).slice(0, 6);
 }
 
-// Масштабирует значения продукта (заданы на 100 г) под введённую порцию.
 function computeMacros(food, grams) {
   const factor = grams / 100;
   return {
@@ -280,7 +254,6 @@ function computeMacros(food, grams) {
   };
 }
 
-// GET /api/patients/{id}/nutrition-log (пока не реализовано на бэкенде)
 async function fetchNutritionLog(patientId) {
   await delay(200);
   return [
@@ -308,7 +281,6 @@ async function fetchNutritionLog(patientId) {
   ];
 }
 
-
 async function fetchWhatIfForecast(patientId, params, baseHistory) {
   await delay(350);
   if (baseHistory.length === 0) return { points: [], netEffect: 0 };
@@ -327,9 +299,9 @@ async function fetchWhatIfForecast(patientId, params, baseHistory) {
       ? last.t - baseHistory[baseHistory.length - 2].t
       : 30 * 60000;
 
-  const horizon = 8; 
+  const horizon = 8;
   const stepWeights = [0.4, 0.7, 0.85, 0.93, 0.97, 0.99, 1, 1];
-  const points = [{ t: last.t, whatIf: last.actual }]; // точка стыковки с фактом
+  const points = [{ t: last.t, whatIf: last.actual }];
   for (let i = 0; i < horizon; i++) {
     const value = Math.max(
       3,
@@ -420,22 +392,6 @@ const STATUS_META = {
   hyper: { label: "Гипергликемия", color: "#993C1D", bg: "#FAECE7" },
 };
 
-// Находит значение "actual" из истории, ближайшее по времени к моменту t —
-// используется, чтобы отметка инсулина на графике визуально стояла на кривой.
-function nearestActualValue(historyRows, t) {
-  if (historyRows.length === 0) return null;
-  let best = historyRows[0];
-  let bestDiff = Math.abs(best.t - t);
-  for (const r of historyRows) {
-    const diff = Math.abs(r.t - t);
-    if (diff < bestDiff) {
-      best = r;
-      bestDiff = diff;
-    }
-  }
-  return best.actual;
-}
-
 function formatTime(iso, rangeKey) {
   const d = new Date(iso);
   if (rangeKey === "7d" || rangeKey === "all") {
@@ -471,12 +427,10 @@ function downloadCsv(history, patientName) {
 }
 
 // ============================================================================
-// Компонент
+// Компонент Dashboard
 // ============================================================================
 
 function Dashboard({ session, onLogout }) {
-  // Список пациентов зависит от роли: админ получает реальный список через
-  // GET /admin/user/{admin_id}, обычный пользователь — только себя.
   const [patients, setPatients] = useState(
     session.role === "user" ? [{ id: session.id, name: session.name }] : []
   );
@@ -499,19 +453,21 @@ function Dashboard({ session, onLogout }) {
     };
   }, [session]);
 
-  const [patientId, setPatientId] = useState(null);
+const [patientId, setPatientId] = useState(null);
+
+  // Устанавливаем первого пациента только при загрузке списка
   useEffect(() => {
-    if (patientId == null && patients.length > 0) setPatientId(patients[0].id);
-  }, [patients, patientId]);
+    if (patients.length > 0 && patientId === null) {
+      setPatientId(patients[0].id);
+    }
+  }, [patients]);  // ← убрали patientId из зависимостей
 
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
 
-  // Сырой ответ бэкенда целиком: { readings, model_predictions, odu_predictions }
   const [snapshot, setSnapshot] = useState(null);
   const [debugOverride, setDebugOverride] = useState("");
   const [nutritionLog, setNutritionLog] = useState([]);
-  const [insulinDoses, setInsulinDoses] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -522,7 +478,6 @@ function Dashboard({ session, onLogout }) {
   const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
   const pollRef = useRef(null);
 
-  // История за выбранный период — период теперь применяется на СЕРВЕРЕ.
   const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
   const latest = useMemo(() => latestReadingFrom(history), [history]);
   const forecastNN = useMemo(
@@ -547,9 +502,7 @@ function Dashboard({ session, onLogout }) {
       .then((res) => {
         if (!cancelled) setFullSnapshot(res);
       })
-      .catch(() => {
-        // "Вся история" необязательна для основного дашборда — тихо игнорируем
-      });
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -585,7 +538,6 @@ function Dashboard({ session, onLogout }) {
     loadAll();
   }, [loadAll]);
 
-  // Автообновление — каждые 30 секунд перезапрашиваем снапшот для того же периода.
   useEffect(() => {
     pollRef.current = setInterval(async () => {
       if (!patientId) return;
@@ -596,7 +548,7 @@ function Dashboard({ session, onLogout }) {
       } catch {
         setConnected(false);
       }
-    }, 30000);
+    }, 60000);
     return () => clearInterval(pollRef.current);
   }, [patientId, currentPeriod]);
 
@@ -608,7 +560,7 @@ function Dashboard({ session, onLogout }) {
         const res = await withRetry(() => fetchWhatIfForecast(patientId, params, history));
         setWhatIfData(res);
       } catch {
-        // сценарий "что если" необязателен — тихо игнорируем сбой
+        // ignore
       } finally {
         setWhatIfLoading(false);
       }
@@ -617,7 +569,7 @@ function Dashboard({ session, onLogout }) {
   );
 
   useEffect(() => {
-    const t = setTimeout(() => runWhatIf(whatIf), 250); // debounce слайдеров
+    const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [whatIf, history]);
@@ -630,8 +582,6 @@ function Dashboard({ session, onLogout }) {
       forecastNN: null,
       forecastODE: null,
       whatIf: null,
-      insulinDose: null,
-      insulinUnits: null,
     }));
 
     const forecastRows = futureForecastRows.map((d) => ({
@@ -641,15 +591,11 @@ function Dashboard({ session, onLogout }) {
       forecastNN: d.forecastNN ?? null,
       forecastODE: d.forecastODE ?? null,
       whatIf: null,
-      insulinDose: null,
-      insulinUnits: null,
     }));
 
     let rows = [...historyRows, ...forecastRows].sort((a, b) => a.t - b.t);
 
-    // Сценарий "что если" накладываем поверх уже собранных рядов: первая
-    // точка whatIfData совпадает по времени с последней точкой истории
-    // (нужна только для стыковки линий), остальные — новые точки в будущем.
+    // Сценарий "что если"
     const whatIfPoints = whatIfData.points;
     if (historyRows.length > 0 && whatIfPoints.length > 0) {
       const [anchor, ...future] = whatIfPoints;
@@ -664,34 +610,12 @@ function Dashboard({ session, onLogout }) {
         forecastNN: null,
         forecastODE: null,
         whatIf: d.whatIf,
-        insulinDose: null,
-        insulinUnits: null,
       }));
       rows = [...rows, ...whatIfFutureRows].sort((a, b) => a.t - b.t);
     }
 
-    // Отметки инсулина — только на фронте (для демонстрации). Ставим маркер
-    // на высоте ближайшего по времени значения глюкозы, чтобы он визуально
-    // сидел прямо на кривой, а не висел в произвольном месте графика.
-    const cfg = RANGE_OPTIONS.find((r) => r.key === rangeKey) || RANGE_OPTIONS[2];
-    const cutoff = Date.now() - cfg.ms;
-    const visibleDoses = insulinDoses.filter((d) => d.t >= cutoff);
-    if (visibleDoses.length > 0 && history.length > 0) {
-      const insulinRows = visibleDoses.map((dose) => ({
-        t: dose.t,
-        label: formatTime(new Date(dose.t).toISOString(), rangeKey),
-        actual: null,
-        forecastNN: null,
-        forecastODE: null,
-        whatIf: null,
-        insulinDose: nearestActualValue(history, dose.t),
-        insulinUnits: dose.units,
-      }));
-      rows = [...rows, ...insulinRows].sort((a, b) => a.t - b.t);
-    }
-
     return rows;
-  }, [history, futureForecastRows, whatIfData, rangeKey, insulinDoses]);
+  }, [history, futureForecastRows, whatIfData, rangeKey]);
 
   const yDomain = useMemo(() => {
     const values = chartData.flatMap((d) =>
@@ -701,8 +625,6 @@ function Dashboard({ session, onLogout }) {
     return [Math.floor(Math.min(...values, 3)) - 0.5, Math.ceil(Math.max(...values, 11)) + 0.5];
   }, [chartData]);
 
-  // Позволяет вручную подставить значение глюкозы для проверки подсказок
-  // (гипо/гипергликемия) — реальные данные бэкенда/заглушки не трогает.
   const displayedLatest = useMemo(() => {
     if (debugOverride === "" || latest == null) return latest;
     const value = Number(debugOverride);
@@ -733,63 +655,57 @@ function Dashboard({ session, onLogout }) {
           </div>
         ) : (
           <>
+            {error && (
+              <div style={styles.errorBanner}>
+                <span>{error}</span>
+                <button style={styles.retryBtn} onClick={loadAll}>
+                  Повторить
+                </button>
+              </div>
+            )}
 
-        {error && (
-          <div style={styles.errorBanner}>
-            <span>{error}</span>
-            <button style={styles.retryBtn} onClick={loadAll}>
-              Повторить
-            </button>
-          </div>
-        )}
+            <DebugPanel value={debugOverride} onChange={setDebugOverride} />
 
-        <DebugPanel value={debugOverride} onChange={setDebugOverride} />
+            <div style={styles.statusRow}>
+              <GlucoseCard latest={displayedLatest} loading={loading} />
+              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
+              <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
+            </div>
 
-        <div style={styles.statusRow}>
-          <GlucoseCard latest={displayedLatest} loading={loading} />
-          <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
-          <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
-        </div>
+            {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
-        {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
+            <RangeSelector rangeKey={rangeKey} onChange={setRangeKey} />
 
-        <RangeSelector rangeKey={rangeKey} onChange={setRangeKey} />
+            <ChartBlock
+              data={chartData}
+              yDomain={yDomain}
+              rangeKey={rangeKey}
+              loading={loading}
+              onExport={() => downloadCss(chartData, patient.name)}
+              nowLabel={
+                history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
+              }
+            />
 
-        <ChartBlock
-          data={chartData}
-          yDomain={yDomain}
-          rangeKey={rangeKey}
-          loading={loading}
-          onExport={() => downloadCsv(chartData, patient.name)}
-          nowLabel={
-            history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
-          }
-        />
+            <WhatIfSimulator
+              whatIf={whatIf}
+              onChange={setWhatIf}
+              loading={whatIfLoading}
+              netEffect={whatIfData.netEffect}
+            />
 
-        <WhatIfSimulator
-          whatIf={whatIf}
-          onChange={setWhatIf}
-          loading={whatIfLoading}
-          netEffect={whatIfData.netEffect}
-        />
+            <div style={styles.bottomRow}>
+              <NutritionLog
+                entries={nutritionLog}
+                onAdd={(entry) => setNutritionLog((prev) => [...prev, entry])}
+              />
+              <Statistics stats={stats} loading={loading} />
+            </div>
 
-        <InsulinPanel
-          doses={insulinDoses}
-          onAdd={(dose) => setInsulinDoses((prev) => [...prev, dose])}
-        />
-
-        <div style={styles.bottomRow}>
-          <NutritionLog
-            entries={nutritionLog}
-            onAdd={(entry) => setNutritionLog((prev) => [...prev, entry])}
-          />
-          <Statistics stats={stats} loading={loading} />
-        </div>
-
-        <FullHistoryTable
-          history={fullHistory}
-          onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
-        />
+            <FullHistoryTable
+              history={fullHistory}
+              onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
+            />
           </>
         )}
 
@@ -860,10 +776,6 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
   );
 }
 
-// Панель только для ручной проверки во время разработки/защиты — позволяет
-// подставить любое значение глюкозы и увидеть, как меняется статус и
-// баннер с подсказкой. Перед сдачей в продакшн этот блок нужно убрать
-// или спрятать за флагом окружения (например, process.env.NODE_ENV).
 function DebugPanel({ value, onChange }) {
   return (
     <div style={styles.debugPanel}>
@@ -924,13 +836,7 @@ function GlucoseCard({ latest, loading }) {
 function ForecastCard({ model, forecast, loading }) {
   return (
     <div style={styles.statCard}>
-      <div style={styles.statCardLabel}>
-        Прогноз
-        <span style={{ ...styles.modelTag, color: model.color }}>
-          {" "}
-          · {model.label}
-        </span>
-      </div>
+      <div style={styles.statCardLabel}>Прогноз</div>
       {loading || !forecast ? (
         <div style={styles.skeleton} />
       ) : (
@@ -942,12 +848,6 @@ function ForecastCard({ model, forecast, loading }) {
               hour: "2-digit",
               minute: "2-digit",
             })}
-            {" · точность "}
-            {model.staticAccuracy}%
-            <span title="Бэкенд пока не отдаёт реальную точность модели — значение для вида.">
-              {" "}
-              *
-            </span>
           </div>
         </>
       )}
@@ -1037,8 +937,6 @@ function ChartBlock({ data, yDomain, rangeKey, loading, onExport, nowLabel }) {
               fillOpacity={0.12}
               ifOverflow="extendDomain"
             />
-            {/* Явно закрашенная зона сценария "что если" справа от "Сейчас" —
-                видна даже если саму линию сложно разглядеть. */}
             {hasScenario && (
               <ReferenceArea
                 x1={nowLabel}
@@ -1063,10 +961,7 @@ function ChartBlock({ data, yDomain, rangeKey, loading, onExport, nowLabel }) {
               />
             )}
             <Tooltip
-              formatter={(value, name, entry) => {
-                if (name === "insulinDose") {
-                  return [`${entry?.payload?.insulinUnits ?? "—"} ед.`, "Инсулин"];
-                }
+              formatter={(value, name) => {
                 return [
                   value == null ? "—" : `${value} ммоль/л`,
                   {
@@ -1125,37 +1020,6 @@ function ChartBlock({ data, yDomain, rangeKey, loading, onExport, nowLabel }) {
                 formatter: (v) => (v == null ? "" : v.toFixed(1)),
               }}
             />
-            <Scatter
-              dataKey="insulinDose"
-              isAnimationActive={false}
-              shape={(props) => {
-                const { cx, cy, payload } = props;
-                if (payload.insulinDose == null) return null;
-                return (
-                  <g>
-                    <line
-                      x1={cx}
-                      y1={cy + 8}
-                      x2={cx}
-                      y2={cy - 16}
-                      stroke="#B23A9E"
-                      strokeWidth={2}
-                    />
-                    <circle cx={cx} cy={cy} r={5} fill="#B23A9E" stroke="#fff" strokeWidth={1.5} />
-                    <text
-                      x={cx}
-                      y={cy - 20}
-                      textAnchor="middle"
-                      fontSize={11}
-                      fontWeight={600}
-                      fill="#B23A9E"
-                    >
-                      {payload.insulinUnits} ед.
-                    </text>
-                  </g>
-                );
-              }}
-            />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -1169,7 +1033,6 @@ function Legend() {
     { color: MODELS.nn.color, label: `Прогноз: ${MODELS.nn.label}`, dash: true },
     { color: MODELS.ode.color, label: `Прогноз: ${MODELS.ode.label}`, dash: true },
     { color: "#C2410C", label: "Сценарий «что если»", dash: false },
-    { color: "#B23A9E", label: "Инсулин", swatch: false, dot: true },
     { color: "#5DCAA5", label: "Целевой диапазон", swatch: true },
   ];
   return (
@@ -1179,11 +1042,8 @@ function Legend() {
           <span
             style={{
               ...styles.legendMark,
-              background: it.swatch ? it.color : it.dot ? it.color : "transparent",
-              borderRadius: it.dot ? "50%" : undefined,
-              width: it.dot ? 10 : undefined,
-              height: it.dot ? 10 : undefined,
-              borderTop: it.swatch || it.dot ? "none" : `2px ${it.dash ? "dashed" : "solid"} ${it.color}`,
+              background: it.swatch ? it.color : "transparent",
+              borderTop: it.swatch ? "none" : `2px ${it.dash ? "dashed" : "solid"} ${it.color}`,
               opacity: it.swatch ? 0.3 : 1,
             }}
           />
@@ -1256,58 +1116,6 @@ function SliderField({ label, unit, min, max, value, onChange }) {
         onChange={onChange}
         style={{ width: "100%" }}
       />
-    </div>
-  );
-}
-
-function InsulinPanel({ doses, onAdd }) {
-  const [units, setUnits] = useState(4);
-  const [type, setType] = useState("bolus");
-
-  const sorted = [...doses].sort((a, b) => b.t - a.t).slice(0, 5);
-
-  const handleAdd = () => {
-    if (!units || units <= 0) return;
-    const now = new Date();
-    onAdd({
-      id: `ins-${Date.now()}`,
-      t: now.getTime(),
-      time: now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
-      units: Number(units),
-      type,
-    });
-  };
-
-  return (
-    <div style={styles.whatIfBlock}>
-      <div style={styles.whatIfHeader}>Дозы инсулина (только для отображения)</div>
-      <div style={styles.insulinFormRow}>
-        <input
-          type="number"
-          min={0.5}
-          step={0.5}
-          value={units}
-          onChange={(e) => setUnits(e.target.value)}
-          style={styles.nutritionGramsInput}
-        />
-        <span style={styles.smallMuted}>ед.</span>
-        <select value={type} onChange={(e) => setType(e.target.value)} style={styles.select}>
-          <option value="bolus">Болюс (короткий)</option>
-          <option value="basal">Базальный (продлённый)</option>
-        </select>
-        <button style={styles.nutritionAddBtn} onClick={handleAdd}>
-          Отметить укол сейчас
-        </button>
-      </div>
-      {sorted.length > 0 && (
-        <div style={styles.insulinList}>
-          {sorted.map((d) => (
-            <span key={d.id} style={styles.insulinListItem}>
-              {d.time} · {d.units} ед. · {d.type === "bolus" ? "болюс" : "базальный"}
-            </span>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -1541,7 +1349,7 @@ function Footer() {
 }
 
 // ============================================================================
-// Стили (inline, без внешних зависимостей на CSS-фреймворк)
+// Стили
 // ============================================================================
 
 const styles = {
@@ -1818,21 +1626,6 @@ const styles = {
     borderRadius: 8,
     padding: "0 12px",
   },
-  insulinFormRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
-  insulinList: {
-    display: "flex",
-    gap: 10,
-    flexWrap: "wrap",
-    marginTop: 12,
-    fontSize: 12,
-    color: "#52514e",
-  },
-  insulinListItem: {
-    background: "#F7F0F5",
-    border: "1px solid #E5C7DD",
-    borderRadius: 999,
-    padding: "4px 10px",
-  },
   nutritionForm: {
     background: "#F7F6F2",
     border: "1px solid #e1e0d9",
@@ -2013,7 +1806,7 @@ const styles = {
 // ============================================================================
 
 function RegisterScreen({ onRegistered }) {
-  const [mode, setMode] = useState("register"); // "register" | "login"
+  const [mode, setMode] = useState("register");
   const [name, setName] = useState("");
   const [role, setRole] = useState("user");
   const [hospitalQuery, setHospitalQuery] = useState("");
@@ -2021,14 +1814,9 @@ function RegisterScreen({ onRegistered }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const [loginIdInput, setLoginIdInput] = useState("");
-  // После успешной регистрации сперва показываем ID для входа, и только
-  // по нажатию "Продолжить" переходим в сам дашборд — иначе пользователь
-  // рискует не заметить/не сохранить свой ID.
   const [justRegistered, setJustRegistered] = useState(null);
-
   const [hasExactHospitalMatch, setHasExactHospitalMatch] = useState(false);
 
-  // Автодополнение больниц теперь бьёт в реальный GET /hospitals с debounce.
   useEffect(() => {
     const q = hospitalQuery.trim();
     if (q.length < 1) {
@@ -2089,9 +1877,6 @@ function RegisterScreen({ onRegistered }) {
           hospitalName: hospital.Name,
         };
       } else {
-        // Пациент сам придумывает себе ID (бэкенд не генерирует его сам).
-        // При коллизии с уже занятым ID сервер ответит ошибкой — тогда
-        // просто пробуем ещё раз с новым случайным ID.
         let created = null;
         let lastErr = null;
         for (let attempt = 0; attempt < 3 && !created; attempt++) {
@@ -2132,7 +1917,6 @@ function RegisterScreen({ onRegistered }) {
     setSubmitting(true);
     try {
       if (/^\d+$/.test(raw)) {
-        // Числовой ID — это пациент.
         const user = await fetchPatientUser(raw);
         const hospitalName = await resolveHospitalName(user.HospitalID);
         onRegistered({
@@ -2144,7 +1928,6 @@ function RegisterScreen({ onRegistered }) {
           hospitalName: hospitalName || "—",
         });
       } else {
-        // Иначе пробуем как UUID администратора.
         const admin = await fetchAdmin(raw);
         const hospitalName = await resolveHospitalName(admin.HospitalID);
         onRegistered({
@@ -2163,7 +1946,6 @@ function RegisterScreen({ onRegistered }) {
     }
   };
 
-  // Экран "вот твой ID, сохрани его" сразу после регистрации.
   if (justRegistered) {
     return (
       <div style={styles.page}>
@@ -2354,7 +2136,7 @@ function RegisterScreen({ onRegistered }) {
 }
 
 // ============================================================================
-// Корневой компонент — решает, показывать экран регистрации или дашборд
+// Корневой компонент
 // ============================================================================
 
 export default function GlucoseDashboardApp() {
