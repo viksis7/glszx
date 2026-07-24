@@ -146,6 +146,9 @@ async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
 }
 
+async function fetchRecommendations(patientId) {
+  return apiFetch(`/recommendations/${patientId}`);
+}
 function buildHistory(readings) {
   return [...(readings || [])]
     .map((r) => ({
@@ -466,6 +469,7 @@ const [patientId, setPatientId] = useState(null);
   const [snapshot, setSnapshot] = useState(null);
   const [debugOverride, setDebugOverride] = useState("");
   const [nutritionLog, setNutritionLog] = useState([]);
+  const [recommendations, setRecommendations] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -473,7 +477,13 @@ const [patientId, setPatientId] = useState(null);
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
-  const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
+const [showCreatePatient, setShowCreatePatient] = useState(false);
+const [newPatientName, setNewPatientName] = useState("");
+const [newPatientId, setNewPatientId] = useState("");
+const [creatingPatient, setCreatingPatient] = useState(false);
+const [createPatientError, setCreatePatientError] = useState(null);
+
+const patient = patients.find((p) => String(p.id) === String(patientId)) || patients[0] || null;
   const pollRef = useRef(null);
 
   const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
@@ -515,12 +525,14 @@ const [patientId, setPatientId] = useState(null);
       return;
     }
     try {
-      const [snapshotRes, nutritionRes] = await Promise.all([
+      const [snapshotRes, nutritionRes, recommendationsRes] = await Promise.all([
         withRetry(() => fetchPatientSnapshot(patientId, currentPeriod)),
         withRetry(() => fetchNutritionLog(patientId)),
+        withRetry(() => fetchRecommendations(patientId)),
       ]);
       setSnapshot(snapshotRes);
       setNutritionLog(nutritionRes);
+      setRecommendations(recommendationsRes);
       setConnected(true);
       setError(null);
     } catch (err) {
@@ -530,6 +542,43 @@ const [patientId, setPatientId] = useState(null);
       setLoading(false);
     }
   }, [patientId, currentPeriod]);
+
+  const handleCreatePatient = async () => {
+    if (!newPatientName.trim() || !newPatientId.trim()) {
+      setCreatePatientError("Заполните имя и ID пациента");
+      return;
+    }
+  
+    setCreatingPatient(true);
+    setCreatePatientError(null);
+  
+    try {
+      // Получаем hospitalId из сессии
+      const hospitalId = session.hospitalId;
+      
+      // Создаём пациента
+      const created = await createPatientUser(
+        newPatientId.trim(),
+        newPatientName.trim(),
+        hospitalId
+      );
+  
+      // Добавляем в список пациентов
+      setPatients(prev => [...prev, { id: created.ID, name: created.Name }]);
+      
+      // Очищаем форму и закрываем модалку
+      setNewPatientName("");
+      setNewPatientId("");
+      setShowCreatePatient(false);
+      
+      // Выбираем созданного пациента
+      setPatientId(created.ID);
+    } catch (err) {
+      setCreatePatientError("Не удалось создать пациента. Возможно, ID уже занят.");
+    } finally {
+      setCreatingPatient(false);
+    }
+  };
 
   useEffect(() => {
     setLoading(true);
@@ -654,6 +703,7 @@ const [patientId, setPatientId] = useState(null);
           connected={connected}
           session={session}
           onLogout={onLogout}
+          onCreatePatient={() => setShowCreatePatient(true)}
         />
 
         {!patientsLoaded ? (
@@ -719,6 +769,11 @@ const [patientId, setPatientId] = useState(null);
               <Statistics stats={stats} loading={loading} />
             </div>
 
+  <RecommendationsPanel 
+  recommendations={recommendations} 
+  loading={loading} 
+/>
+
             <FullHistoryTable
               history={fullHistory}
               onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
@@ -752,17 +807,27 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
+  {/* ✨ НОВАЯ СТРОКА: кнопка для администратора */}
+  {session.role === "admin" && (
+    <button 
+      style={styles.createPatientBtn}
+      onClick={onCreatePatient}
+    >
+      + Создать пациента
+    </button>
+  )}
+
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
             Пациент:
             {patients.length === 0 ? (
               <span style={styles.smallMuted}> нет пациентов</span>
             ) : (
-              <select
-                value={patient?.id ?? ""}
-                onChange={(e) => onPatientChange(e.target.value)}
-                style={styles.select}
-              >
+            <select
+            value={String(patient?.id ?? "")}
+            onChange={(e) => onPatientChange(e.target.value)}
+            style={styles.select}
+            >
                 {patients.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
@@ -1299,6 +1364,61 @@ function Statistics({ stats, loading }) {
   );
 }
 
+function RecommendationsPanel({ recommendations, loading }) {
+  if (loading) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.skeleton} />
+      </div>
+    );
+  }
+
+  if (!recommendations) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.smallMuted}>Нет рекомендаций</div>
+      </div>
+    );
+  }
+
+  // Предполагаем, что бэкенд возвращает объект с полями:
+  // { nutrition: "...", activity: "...", insulin: "...", general: "..." }
+  // или массив рекомендаций: [{ type: "nutrition", text: "..." }, ...]
+  
+  const items = Array.isArray(recommendations) 
+    ? recommendations 
+    : Object.entries(recommendations).map(([key, value]) => ({
+        type: key,
+        text: value,
+      }));
+
+  const typeLabels = {
+    nutrition: " Питание",
+    activity: " Активность",
+    insulin: " Инсулин",
+    general: " Общие",
+    monitoring: " Мониторинг",
+  };
+
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Рекомендации</div>
+      <div style={styles.recommendationsList}>
+        {items.map((item, index) => (
+          <div key={index} style={styles.recommendationItem}>
+            <div style={styles.recommendationType}>
+              {typeLabels[item.type] || item.type}
+            </div>
+            <div style={styles.recommendationText}>{item.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatRow({ label, value }) {
   return (
     <div style={styles.statRow}>
@@ -1813,6 +1933,28 @@ const styles = {
     fontFamily: "monospace",
     marginTop: 2,
     wordBreak: "break-all",
+  },
+  recommendationsList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  },
+  recommendationItem: {
+    background: "#F7F6F2",
+    border: "1px solid #e1e0d9",
+    borderRadius: 10,
+    padding: "12px 14px",
+  },
+  recommendationType: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#0C447C",
+    marginBottom: 6,
+  },
+  recommendationText: {
+    fontSize: 13,
+    lineHeight: 1.5,
+    color: "#52514e",
   },
   loginIdDisplay: {
     fontFamily: "monospace",
