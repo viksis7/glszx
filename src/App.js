@@ -98,9 +98,7 @@ async function findOrCreateHospital(name) {
 }
 
 function toNullUUID(uuidStr) {
-  return uuidStr
-    ? { UUID: uuidStr, Valid: true }
-    : { UUID: "00000000-0000-0000-0000-000000000000", Valid: false };
+  return uuidStr || null;
 }
 function fromNullUUID(value) {
   if (value == null) return null;
@@ -130,7 +128,7 @@ async function createPatientUser(id, name, hospitalId) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ 
-      id: parseInt(id, 10),  // ← конвертируем строку в число
+      id: parseInt(id, 10), // ✅ Исправлено: отправляем число, а не строку
       name, 
       hospital_id: toNullUUID(hospitalId) 
     }),
@@ -150,6 +148,10 @@ async function resolveHospitalName(hospitalIdRaw) {
 
 async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
+}
+
+async function fetchRecommendations(patientId) {
+  return apiFetch(`/recommendations/${patientId}`);
 }
 
 function buildHistory(readings) {
@@ -190,27 +192,28 @@ function latestReadingFrom(history) {
   };
 }
 
+// ✅ ИСПРАВЛЕНО: Берём последнее предсказание и прибавляем к нему 30 минут
 function latestForecastFrom(predictions) {
   if (!predictions || predictions.length === 0) return null;
 
-  const now = Date.now();
-
-  // Оставляем только прогнозы на БУДУЩЕЕ (после текущего момента)
-  const future = predictions
-    .filter((p) => new Date(p.TimePredicted).getTime() > now)
-    .sort((a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted));
-
-  // Если будущих нет — берём самый поздний из всех (последний сделанный)
-  const list = future.length > 0 ? future : [...predictions].sort(
+  // Сортируем по убыванию (сначала самые поздние)
+  const sorted = [...predictions].sort(
     (a, b) => new Date(b.TimePredicted) - new Date(a.TimePredicted)
   );
 
-  if (list.length === 0) return null;
-
-  const next = list[0]; // теперь это ближайшее будущее значение
-  const value = toNum(next.GlucosePredicted);
+  // Берём последнее (самое позднее) предсказание
+  const last = sorted[0];
+  const value = toNum(last.GlucosePredicted);
   if (value == null) return null;
-  return { value, forecastFor: next.TimePredicted };
+
+  // Прибавляем 30 минут к времени предсказания
+  const forecastTime = new Date(last.TimePredicted);
+  forecastTime.setMinutes(forecastTime.getMinutes() + 30);
+
+  return { 
+    value, 
+    forecastFor: forecastTime.toISOString() 
+  };
 }
 
 function computeStats(historyRows) {
@@ -469,14 +472,14 @@ function Dashboard({ session, onLogout }) {
     };
   }, [session]);
 
-const [patientId, setPatientId] = useState(null);
+  const [patientId, setPatientId] = useState(null);
 
   // Устанавливаем первого пациента только при загрузке списка
   useEffect(() => {
     if (patients.length > 0 && patientId === null) {
       setPatientId(patients[0].id);
     }
-  }, [patients]);  // ← убрали patientId из зависимостей
+  }, [patients]);
 
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
@@ -484,6 +487,7 @@ const [patientId, setPatientId] = useState(null);
   const [snapshot, setSnapshot] = useState(null);
   const [debugOverride, setDebugOverride] = useState("");
   const [nutritionLog, setNutritionLog] = useState([]);
+  const [recommendations, setRecommendations] = useState(null); // ✅ Добавлено состояние
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -491,7 +495,14 @@ const [patientId, setPatientId] = useState(null);
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
-  const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
+  // ✅ Состояния для создания пациента администратором
+  const [showCreatePatient, setShowCreatePatient] = useState(false);
+  const [newPatientName, setNewPatientName] = useState("");
+  const [newPatientId, setNewPatientId] = useState("");
+  const [creatingPatient, setCreatingPatient] = useState(false);
+  const [createPatientError, setCreatePatientError] = useState(null);
+
+  const patient = patients.find((p) => String(p.id) === String(patientId)) || patients[0] || null;
   const pollRef = useRef(null);
 
   const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
@@ -527,12 +538,11 @@ const [patientId, setPatientId] = useState(null);
 
   const currentPeriod = RANGE_OPTIONS.find((r) => r.key === rangeKey)?.period || "24h";
 
+  // ✅ ИСПРАВЛЕНО: Загрузка рекомендаций отделена от основных данных
   const loadAll = useCallback(async () => {
-    if (!patientId) {
-      setLoading(false);
-      return;
-    }
+    if (!patientId) { setLoading(false); return; }
     try {
+      // Загружаем основные данные (глюкоза + питание)
       const [snapshotRes, nutritionRes] = await Promise.all([
         withRetry(() => fetchPatientSnapshot(patientId, currentPeriod)),
         withRetry(() => fetchNutritionLog(patientId)),
@@ -544,10 +554,46 @@ const [patientId, setPatientId] = useState(null);
     } catch (err) {
       setConnected(false);
       setError("Не удалось получить данные с сервера.");
-    } finally {
-      setLoading(false);
     }
+  
+    // Загружаем рекомендации ОТДЕЛЬНО — ошибка не ломает остальное
+    try {
+      const recommendationsRes = await withRetry(() => fetchRecommendations(patientId));
+      setRecommendations(recommendationsRes);
+    } catch (err) {
+      // Если бэкенд не готов — показываем демо-рекомендации
+      setRecommendations({
+        nutrition: "Рекомендуется соблюдать режим питания. Ограничьте быстрые углеводы.",
+        activity: "Добавьте 30 минут лёгкой физической активности в день.",
+        general: "Продолжайте регулярный мониторинг глюкозы.",
+      });
+    }
+  
+    setLoading(false);
   }, [patientId, currentPeriod]);
+
+  // ✅ Функция создания пациента
+  const handleCreatePatient = async () => {
+    if (!newPatientName.trim() || !newPatientId.trim()) {
+      setCreatePatientError("Заполните имя и ID пациента");
+      return;
+    }
+    setCreatingPatient(true);
+    setCreatePatientError(null);
+    try {
+      const hospitalId = session.hospitalId;
+      const created = await createPatientUser(newPatientId.trim(), newPatientName.trim(), hospitalId);
+      setPatients((prev) => [...prev, { id: created.ID, name: created.Name }]);
+      setNewPatientName("");
+      setNewPatientId("");
+      setShowCreatePatient(false);
+      setPatientId(created.ID);
+    } catch (err) {
+      setCreatePatientError("Не удалось создать пациента. Возможно, ID уже занят.");
+    } finally {
+      setCreatingPatient(false);
+    }
+  };
 
   useEffect(() => {
     setLoading(true);
@@ -584,11 +630,11 @@ const [patientId, setPatientId] = useState(null);
     [patientId, history]
   );
 
+  // ✅ Исправлены зависимости useEffect
   useEffect(() => {
     const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [whatIf, history]);
+  }, [whatIf, history, runWhatIf]);
 
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
@@ -658,6 +704,7 @@ const [patientId, setPatientId] = useState(null);
           connected={connected}
           session={session}
           onLogout={onLogout}
+          onCreatePatient={() => setShowCreatePatient(true)} // ✅ Передача пропа
         />
 
         {!patientsLoaded ? (
@@ -684,9 +731,13 @@ const [patientId, setPatientId] = useState(null);
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
-              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
+              {/* ✅ Вернуты названия моделей */}
+              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} modelStatus={!forecastNN && !loading ? 'training' : undefined} />
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
+
+            {/* ✅ Рекомендации сразу после прогнозов */}
+            <RecommendationsPanel recommendations={recommendations} loading={loading} />
 
             {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
@@ -697,7 +748,7 @@ const [patientId, setPatientId] = useState(null);
               yDomain={yDomain}
               rangeKey={rangeKey}
               loading={loading}
-              onExport={() => downloadCss(chartData, patient.name)}
+              onExport={() => downloadCsv(chartData, patient.name)} // ✅ Исправлена опечатка
               nowLabel={
                 history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
               }
@@ -725,6 +776,35 @@ const [patientId, setPatientId] = useState(null);
           </>
         )}
 
+        {/* ✅ Модальное окно создания пациента */}
+        {showCreatePatient && (
+          <div style={styles.modalOverlay}>
+            <div style={styles.modalContent}>
+              <div style={styles.modalHeader}>
+                <h3 style={styles.modalTitle}>Создание нового пациента</h3>
+                <button style={styles.modalCloseBtn} onClick={() => { setShowCreatePatient(false); setCreatePatientError(null); setNewPatientName(""); setNewPatientId(""); }}>×</button>
+              </div>
+              <div style={styles.modalBody}>
+                {createPatientError && <div style={styles.errorBanner}>{createPatientError}</div>}
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Имя пациента</label>
+                  <input type="text" value={newPatientName} onChange={(e) => setNewPatientName(e.target.value)} placeholder="Например, Иван Петров" style={styles.formInput} autoFocus />
+                </div>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>ID пациента <span style={styles.formHint}>(только цифры, 6 знаков, для симулятора)</span></label>
+                  <input type="text" value={newPatientId} onChange={(e) => setNewPatientId(e.target.value.replace(/\D/g, ''))} placeholder="Например, 123456" maxLength={6} style={styles.formInput} />
+                </div>
+                <div style={styles.modalFooter}>
+                  <button style={styles.cancelBtn} onClick={() => { setShowCreatePatient(false); setCreatePatientError(null); setNewPatientName(""); setNewPatientId(""); }} disabled={creatingPatient}>Отмена</button>
+                  <button style={styles.createBtn} onClick={handleCreatePatient} disabled={creatingPatient || !newPatientName.trim() || !newPatientId.trim()}>
+                    {creatingPatient ? "Создание..." : "Создать"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <Footer />
       </div>
     </div>
@@ -735,7 +815,8 @@ const [patientId, setPatientId] = useState(null);
 // Подкомпоненты
 // ============================================================================
 
-function Header({ patient, patients, onPatientChange, connected, session, onLogout }) {
+// ✅ Добавлен проп onCreatePatient
+function Header({ patient, patients, onPatientChange, connected, session, onLogout, onCreatePatient }) {
   return (
     <div style={styles.header}>
       <div style={styles.logo}>
@@ -751,6 +832,11 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
+        {/* ✅ Кнопка создания пациента для админа */}
+        {session.role === "admin" && (
+          <button style={styles.createPatientBtn} onClick={onCreatePatient}>+ Создать пациента</button>
+        )}
+
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
             Пациент:
@@ -758,7 +844,7 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
               <span style={styles.smallMuted}> нет пациентов</span>
             ) : (
               <select
-                value={patient?.id ?? ""}
+                value={String(patient?.id ?? "")} // ✅ Приведение к строке
                 onChange={(e) => onPatientChange(e.target.value)}
                 style={styles.select}
               >
@@ -849,16 +935,29 @@ function GlucoseCard({ latest, loading }) {
   );
 }
 
-function ForecastCard({ model, forecast, loading }) {
+// ✅ Вернуты названия моделей в карточках
+function ForecastCard({ model, forecast, loading, modelStatus }) {
   return (
     <div style={styles.statCard}>
-     <div style={styles.statCardLabel}>
-  Прогноз
-  <span style={{ ...styles.modelTag, color: model.color }}>
-    {" "}· {model.label}
-  </span>
-</div>
-      {loading || !forecast ? (
+      <div style={styles.statCardLabel}>
+        Прогноз
+        <span style={{ ...styles.modelTag, color: model.color }}>
+          {" "}· {model.label}
+        </span>
+      </div>
+      {loading ? (
+        <div style={styles.skeleton} />
+      ) : !forecast && modelStatus === 'training' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Ожидаю обучение</span>
+          <div style={styles.smallMuted}>Модель ещё не готова к прогнозам</div>
+        </>
+      ) : !forecast && modelStatus === 'not_ready' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Не готов</span>
+          <div style={styles.smallMuted}>Нет данных для прогноза</div>
+        </>
+      ) : !forecast ? (
         <div style={styles.skeleton} />
       ) : (
         <>
@@ -1283,6 +1382,43 @@ function Statistics({ stats, loading }) {
   );
 }
 
+// ✅ Компонент рекомендаций
+function RecommendationsPanel({ recommendations, loading }) {
+  if (loading) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.skeleton} />
+      </div>
+    );
+  }
+  if (!recommendations) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.smallMuted}>Нет рекомендаций</div>
+      </div>
+    );
+  }
+  const items = Array.isArray(recommendations)
+    ? recommendations
+    : Object.entries(recommendations).map(([key, value]) => ({ type: key, text: value }));
+  const typeLabels = { nutrition: "🍎 Питание", activity: "🏃 Активность", insulin: "💉 Инсулин", general: " Общие", monitoring: "📊 Мониторинг" };
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Рекомендации</div>
+      <div style={styles.recommendationsList}>
+        {items.map((item, index) => (
+          <div key={index} style={styles.recommendationItem}>
+            <div style={styles.recommendationType}>{typeLabels[item.type] || item.type}</div>
+            <div style={styles.recommendationText}>{item.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatRow({ label, value }) {
   return (
     <div style={styles.statRow}>
@@ -1300,8 +1436,7 @@ function FullHistoryTable({ history, onExport }) {
     <div style={styles.panel}>
       <div style={styles.historyHeaderRow}>
         <button style={styles.historyToggleBtn} onClick={() => setOpen((v) => !v)}>
-          {open ? "▾" : "▸"} История измерений за выбранный период ({history.length})
-          — выбери «Всё время» вверху, чтобы увидеть все измерения
+          {open ? "▾" : "▸"} История измерений ({history.length})
         </button>
         <button style={styles.exportBtn} onClick={onExport}>
           Экспорт в CSV
@@ -1314,12 +1449,7 @@ function FullHistoryTable({ history, onExport }) {
           ) : (
             <table style={styles.table}>
               <thead>
-                <tr>
-                  <th style={styles.th}>Дата</th>
-                  <th style={styles.th}>Время</th>
-                  <th style={styles.th}>Глюкоза</th>
-                  <th style={styles.th}>Статус</th>
-                </tr>
+                <tr><th style={styles.th}>Дата</th><th style={styles.th}>Время</th><th style={styles.th}>Глюкоза</th><th style={styles.th}>Статус</th></tr>
               </thead>
               <tbody>
                 {sorted.map((d) => {
@@ -1328,24 +1458,10 @@ function FullHistoryTable({ history, onExport }) {
                   const meta = status ? STATUS_META[status] : null;
                   return (
                     <tr key={d.t}>
-                      <td style={styles.td}>
-                        {dt.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}
-                      </td>
-                      <td style={styles.td}>
-                        {dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}
-                      </td>
-                      <td style={styles.td}>
-                        {d.actual != null ? `${d.actual} ммоль/л` : "—"}
-                      </td>
-                      <td style={styles.td}>
-                        {meta && (
-                          <span
-                            style={{ ...styles.badge, color: meta.color, background: meta.bg }}
-                          >
-                            {meta.label}
-                          </span>
-                        )}
-                      </td>
+                      <td style={styles.td}>{dt.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}</td>
+                      <td style={styles.td}>{dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</td>
+                      <td style={styles.td}>{d.actual != null ? `${d.actual} ммоль/л` : "—"}</td>
+                      <td style={styles.td}>{meta && <span style={{ ...styles.badge, color: meta.color, background: meta.bg }}>{meta.label}</span>}</td>
                     </tr>
                   );
                 })}
@@ -1374,452 +1490,106 @@ function Footer() {
 // ============================================================================
 
 const styles = {
-  page: {
-    minHeight: "100vh",
-    background: "#EEF0F3",
-    padding: "32px 16px",
-    fontFamily:
-      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-    display: "flex",
-    justifyContent: "center",
-  },
-  card: {
-    width: "100%",
-    maxWidth: 960,
-    background: "#ffffff",
-    borderRadius: 20,
-    padding: 28,
-    boxSizing: "border-box",
-  },
-  header: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 12,
-    marginBottom: 20,
-  },
+  page: { minHeight: "100vh", background: "#EEF0F3", padding: "32px 16px", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif", display: "flex", justifyContent: "center" },
+  card: { width: "100%", maxWidth: 960, background: "#ffffff", borderRadius: 20, padding: 28, boxSizing: "border-box" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 20 },
   logo: { display: "flex", alignItems: "center", gap: 8 },
-  logoMark: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
-    background: "linear-gradient(135deg, #185FA5, #0F6E56)",
-  },
+  logoMark: { width: 26, height: 26, borderRadius: 8, background: "linear-gradient(135deg, #185FA5, #0F6E56)" },
   logoText: { fontWeight: 500, fontSize: 16, color: "#0b0b0b" },
   headerRight: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
   sessionInfo: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 },
-  roleBadge: {
-    fontSize: 12,
-    fontWeight: 600,
-    color: "#0C447C",
-    background: "#E7F0FA",
-    borderRadius: 999,
-    padding: "2px 10px",
-  },
-  logoutBtn: {
-    border: "1px solid #d3d1c7",
-    background: "#fff",
-    borderRadius: 8,
-    padding: "6px 12px",
-    fontSize: 12,
-    cursor: "pointer",
-    color: "#52514e",
-  },
-  patientLabel: {
-    fontSize: 13,
-    color: "#52514e",
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-  },
-  select: {
-    padding: "6px 10px",
-    borderRadius: 8,
-    border: "1px solid #d3d1c7",
-    fontSize: 13,
-    background: "#fff",
-  },
-  connectionIndicator: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    fontSize: 13,
-    color: "#52514e",
-  },
+  roleBadge: { fontSize: 12, fontWeight: 600, color: "#0C447C", background: "#E7F0FA", borderRadius: 999, padding: "2px 10px" },
+  logoutBtn: { border: "1px solid #d3d1c7", background: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", color: "#52514e" },
+  patientLabel: { fontSize: 13, color: "#52514e", display: "flex", alignItems: "center", gap: 8 },
+  select: { padding: "6px 10px", borderRadius: 8, border: "1px solid #d3d1c7", fontSize: 13, background: "#fff" },
+  connectionIndicator: { display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#52514e" },
   connectionDot: { width: 8, height: 8, borderRadius: "50%" },
-  debugPanel: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    flexWrap: "wrap",
-    background: "#F1EFE8",
-    border: "1px dashed #c3c2b7",
-    borderRadius: 10,
-    padding: "8px 12px",
-    marginBottom: 16,
-    fontSize: 12,
-  },
+  debugPanel: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", background: "#F1EFE8", border: "1px dashed #c3c2b7", borderRadius: 10, padding: "8px 12px", marginBottom: 16, fontSize: 12 },
   debugLabel: { color: "#52514e", fontWeight: 500 },
-  debugInput: {
-    width: 130,
-    padding: "4px 8px",
-    borderRadius: 6,
-    border: "1px solid #d3d1c7",
-    fontSize: 12,
-  },
+  debugInput: { width: 130, padding: "4px 8px", borderRadius: 6, border: "1px solid #d3d1c7", fontSize: 12 },
   debugHint: { color: "#898781" },
-  debugReset: {
-    border: "1px solid #d3d1c7",
-    background: "#fff",
-    borderRadius: 6,
-    padding: "3px 10px",
-    fontSize: 12,
-    cursor: "pointer",
-  },
-  emptyState: {
-    background: "#F7F6F2",
-    border: "1px dashed #c3c2b7",
-    borderRadius: 10,
-    padding: "20px 16px",
-    fontSize: 13,
-    color: "#52514e",
-    textAlign: "center",
-  },
-  errorBanner: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    background: "#FAECE7",
-    color: "#712B13",
-    padding: "10px 14px",
-    borderRadius: 10,
-    fontSize: 13,
-    marginBottom: 16,
-  },
-  retryBtn: {
-    border: "1px solid #993C1D",
-    background: "transparent",
-    color: "#712B13",
-    borderRadius: 6,
-    padding: "4px 10px",
-    fontSize: 12,
-    cursor: "pointer",
-  },
-  statusRow: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-    gap: 14,
-    marginBottom: 20,
-  },
-  statCard: {
-    border: "1px solid #e1e0d9",
-    borderRadius: 14,
-    padding: "16px 18px",
-    minHeight: 74,
-  },
+  debugReset: { border: "1px solid #d3d1c7", background: "#fff", borderRadius: 6, padding: "3px 10px", fontSize: 12, cursor: "pointer" },
+  emptyState: { background: "#F7F6F2", border: "1px dashed #c3c2b7", borderRadius: 10, padding: "20px 16px", fontSize: 13, color: "#52514e", textAlign: "center" },
+  errorBanner: { display: "flex", justifyContent: "space-between", alignItems: "center", background: "#FAECE7", color: "#712B13", padding: "10px 14px", borderRadius: 10, fontSize: 13, marginBottom: 16 },
+  retryBtn: { border: "1px solid #993C1D", background: "transparent", color: "#712B13", borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" },
+  statusRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 20 },
+  statCard: { border: "1px solid #e1e0d9", borderRadius: 14, padding: "16px 18px", minHeight: 74 },
   statCardLabel: { fontSize: 12, color: "#898781", marginBottom: 6 },
   modelTag: { fontSize: 12, fontWeight: 600 },
   bigValue: { fontSize: 22, fontWeight: 500, color: "#0b0b0b" },
-  badge: {
-    fontSize: 12,
-    fontWeight: 500,
-    padding: "3px 10px",
-    borderRadius: 999,
-  },
+  badge: { fontSize: 12, fontWeight: 500, padding: "3px 10px", borderRadius: 999 },
   smallMuted: { fontSize: 12, color: "#898781", marginTop: 4 },
-  skeleton: {
-    height: 34,
-    borderRadius: 6,
-    background: "#f1efe8",
-  },
-  tipsBanner: {
-    border: "1px solid",
-    borderRadius: 12,
-    padding: "12px 16px",
-    marginBottom: 16,
-  },
+  skeleton: { height: 34, borderRadius: 6, background: "#f1efe8" },
+  tipsBanner: { border: "1px solid", borderRadius: 12, padding: "12px 16px", marginBottom: 16 },
   tipsTitle: { fontSize: 13, fontWeight: 600, marginBottom: 4 },
   tipsText: { fontSize: 13, lineHeight: 1.4 },
-  tipsDisclaimer: {
-    fontSize: 11,
-    color: "#898781",
-    marginTop: 6,
-    fontStyle: "italic",
-  },
+  tipsDisclaimer: { fontSize: 11, color: "#898781", marginTop: 6, fontStyle: "italic" },
   rangeRow: { display: "flex", gap: 8, marginBottom: 16 },
-  rangeBtn: {
-    border: "1px solid #d3d1c7",
-    background: "#fff",
-    borderRadius: 999,
-    padding: "6px 16px",
-    fontSize: 13,
-    cursor: "pointer",
-    color: "#52514e",
-  },
-  rangeBtnActive: {
-    background: "#0C447C",
-    borderColor: "#0C447C",
-    color: "#fff",
-  },
+  rangeBtn: { border: "1px solid #d3d1c7", background: "#fff", borderRadius: 999, padding: "6px 16px", fontSize: 13, cursor: "pointer", color: "#52514e" },
+  rangeBtnActive: { background: "#0C447C", borderColor: "#0C447C", color: "#fff" },
   chartBlock: { marginBottom: 24 },
-  chartHeaderRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 8,
-    flexWrap: "wrap",
-    gap: 8,
-  },
+  chartHeaderRow: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 },
   legendRow: { display: "flex", gap: 14, flexWrap: "wrap" },
-  legendItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    fontSize: 12,
-    color: "#52514e",
-  },
+  legendItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#52514e" },
   legendMark: { width: 16, height: 10, borderRadius: 3 },
-  exportBtn: {
-    border: "1px solid #d3d1c7",
-    background: "#fff",
-    borderRadius: 8,
-    padding: "6px 12px",
-    fontSize: 12,
-    cursor: "pointer",
-    color: "#0b0b0b",
-  },
-  whatIfBlock: {
-    border: "1px solid #e1e0d9",
-    borderRadius: 14,
-    padding: "16px 18px",
-    marginBottom: 24,
-  },
+  exportBtn: { border: "1px solid #d3d1c7", background: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", color: "#0b0b0b" },
+  whatIfBlock: { border: "1px solid #e1e0d9", borderRadius: 14, padding: "16px 18px", marginBottom: 24 },
   whatIfHeader: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
   effectReadout: { fontSize: 13, fontWeight: 600, marginBottom: 14 },
-  slidersRow: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-    gap: 20,
-  },
+  slidersRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 20 },
   sliderField: {},
-  sliderLabelRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    fontSize: 13,
-    color: "#52514e",
-    marginBottom: 6,
-  },
+  sliderLabelRow: { display: "flex", justifyContent: "space-between", fontSize: 13, color: "#52514e", marginBottom: 6 },
   sliderValue: { fontWeight: 500, color: "#0b0b0b" },
-  bottomRow: {
-    display: "grid",
-    gridTemplateColumns: "1.4fr 1fr",
-    gap: 20,
-    marginBottom: 20,
-  },
-  panel: {
-    border: "1px solid #e1e0d9",
-    borderRadius: 14,
-    padding: "16px 18px",
-  },
+  bottomRow: { display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 20, marginBottom: 20 },
+  panel: { border: "1px solid #e1e0d9", borderRadius: 14, padding: "16px 18px", marginBottom: 20 },
   panelTitle: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
-  historyHeaderRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  historyToggleBtn: {
-    border: "none",
-    background: "transparent",
-    fontSize: 14,
-    fontWeight: 500,
-    cursor: "pointer",
-    color: "#0b0b0b",
-    padding: 0,
-  },
-  historyScroll: {
-    marginTop: 14,
-    maxHeight: 320,
-    overflowY: "auto",
-    border: "1px solid #f1efe8",
-    borderRadius: 8,
-    padding: "0 12px",
-  },
-  nutritionForm: {
-    background: "#F7F6F2",
-    border: "1px solid #e1e0d9",
-    borderRadius: 10,
-    padding: "10px 12px",
-    marginBottom: 14,
-  },
+  historyHeaderRow: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 },
+  historyToggleBtn: { border: "none", background: "transparent", fontSize: 14, fontWeight: 500, cursor: "pointer", color: "#0b0b0b", padding: 0 },
+  historyScroll: { marginTop: 14, maxHeight: 320, overflowY: "auto", border: "1px solid #f1efe8", borderRadius: 8, padding: "0 12px" },
+  nutritionForm: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "10px 12px", marginBottom: 14 },
   nutritionFormRow: { display: "flex", gap: 8, alignItems: "center" },
-  nutritionInput: {
-    width: "100%",
-    padding: "6px 10px",
-    borderRadius: 6,
-    border: "1px solid #d3d1c7",
-    fontSize: 13,
-    boxSizing: "border-box",
-  },
-  nutritionGramsInput: {
-    width: 64,
-    padding: "6px 8px",
-    borderRadius: 6,
-    border: "1px solid #d3d1c7",
-    fontSize: 13,
-  },
-  nutritionAddBtn: {
-    border: "none",
-    background: "#0C447C",
-    color: "#fff",
-    borderRadius: 6,
-    padding: "7px 14px",
-    fontSize: 13,
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-  },
-  nutritionPreview: {
-    marginTop: 8,
-    fontSize: 12,
-    color: "#0F6E56",
-    fontWeight: 500,
-  },
-  suggestList: {
-    position: "absolute",
-    top: "100%",
-    left: 0,
-    right: 0,
-    background: "#fff",
-    border: "1px solid #d3d1c7",
-    borderRadius: 8,
-    marginTop: 4,
-    zIndex: 5,
-    boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-    maxHeight: 200,
-    overflowY: "auto",
-  },
-  suggestItem: {
-    padding: "8px 12px",
-    fontSize: 13,
-    cursor: "pointer",
-    borderBottom: "1px solid #f1efe8",
-  },
-  suggestEmpty: {
-    position: "absolute",
-    top: "100%",
-    left: 0,
-    right: 0,
-    background: "#fff",
-    border: "1px solid #d3d1c7",
-    borderRadius: 8,
-    marginTop: 4,
-    padding: "8px 12px",
-    fontSize: 12,
-    color: "#898781",
-    zIndex: 5,
-  },
+  nutritionInput: { width: "100%", padding: "6px 10px", borderRadius: 6, border: "1px solid #d3d1c7", fontSize: 13, boxSizing: "border-box" },
+  nutritionGramsInput: { width: 64, padding: "6px 8px", borderRadius: 6, border: "1px solid #d3d1c7", fontSize: 13 },
+  nutritionAddBtn: { border: "none", background: "#0C447C", color: "#fff", borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" },
+  nutritionPreview: { marginTop: 8, fontSize: 12, color: "#0F6E56", fontWeight: 500 },
+  suggestList: { position: "absolute", top: "100%", left: 0, right: 0, background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, marginTop: 4, zIndex: 5, boxShadow: "0 4px 12px rgba(0,0,0,0.08)", maxHeight: 200, overflowY: "auto" },
+  suggestItem: { padding: "8px 12px", fontSize: 13, cursor: "pointer", borderBottom: "1px solid #f1efe8" },
+  suggestEmpty: { position: "absolute", top: "100%", left: 0, right: 0, background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, marginTop: 4, padding: "8px 12px", fontSize: 12, color: "#898781", zIndex: 5 },
   table: { width: "100%", borderCollapse: "collapse", fontSize: 13 },
-  th: {
-    textAlign: "left",
-    color: "#898781",
-    fontWeight: 500,
-    fontSize: 12,
-    paddingBottom: 8,
-  },
+  th: { textAlign: "left", color: "#898781", fontWeight: 500, fontSize: 12, paddingBottom: 8 },
   td: { padding: "8px 0", borderTop: "1px solid #f1efe8" },
-  matchBadge: {
-    fontSize: 11,
-    padding: "3px 8px",
-    borderRadius: 999,
-    whiteSpace: "nowrap",
-  },
+  matchBadge: { fontSize: 11, padding: "3px 8px", borderRadius: 999, whiteSpace: "nowrap" },
   statsGrid: { display: "flex", flexDirection: "column", gap: 10 },
   statRow: { display: "flex", justifyContent: "space-between", fontSize: 13 },
-  footer: {
-    display: "flex",
-    justifyContent: "space-between",
-    fontSize: 12,
-    color: "#898781",
-    borderTop: "1px solid #f1efe8",
-    paddingTop: 14,
-  },
+  footer: { display: "flex", justifyContent: "space-between", fontSize: 12, color: "#898781", borderTop: "1px solid #f1efe8", paddingTop: 14 },
   footerLink: { color: "#185FA5", textDecoration: "none" },
   formLabel: { fontSize: 13, fontWeight: 500, marginBottom: 6, color: "#52514e" },
-  authTabsRow: {
-    display: "flex",
-    gap: 4,
-    marginTop: 16,
-    marginBottom: 12,
-    background: "#F1EFE8",
-    borderRadius: 10,
-    padding: 4,
-  },
-  authTab: {
-    flex: 1,
-    border: "none",
-    background: "transparent",
-    borderRadius: 8,
-    padding: "8px 0",
-    fontSize: 13,
-    cursor: "pointer",
-    color: "#52514e",
-  },
-  authTabActive: {
-    background: "#fff",
-    color: "#0b0b0b",
-    fontWeight: 500,
-    boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
-  },
-  accountList: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    marginTop: 14,
-  },
-  accountItem: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "flex-start",
-    gap: 2,
-    textAlign: "left",
-    border: "1px solid #d3d1c7",
-    borderRadius: 10,
-    padding: "10px 14px",
-    background: "#fff",
-    cursor: "pointer",
-    fontSize: 13,
-  },
-  accountId: {
-    fontSize: 11,
-    color: "#898781",
-    fontFamily: "monospace",
-    marginTop: 2,
-    wordBreak: "break-all",
-  },
-  loginIdDisplay: {
-    fontFamily: "monospace",
-    fontSize: 20,
-    fontWeight: 600,
-    background: "#F1EFE8",
-    border: "1px dashed #c3c2b7",
-    borderRadius: 10,
-    padding: "12px 16px",
-    marginTop: 6,
-    marginBottom: 10,
-    textAlign: "center",
-    wordBreak: "break-all",
-  },
+  authTabsRow: { display: "flex", gap: 4, marginTop: 16, marginBottom: 12, background: "#F1EFE8", borderRadius: 10, padding: 4 },
+  authTab: { flex: 1, border: "none", background: "transparent", borderRadius: 8, padding: "8px 0", fontSize: 13, cursor: "pointer", color: "#52514e" },
+  authTabActive: { background: "#fff", color: "#0b0b0b", fontWeight: 500, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" },
+  accountList: { display: "flex", flexDirection: "column", gap: 8, marginTop: 14 },
+  accountItem: { display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, textAlign: "left", border: "1px solid #d3d1c7", borderRadius: 10, padding: "10px 14px", background: "#fff", cursor: "pointer", fontSize: 13 },
+  accountId: { fontSize: 11, color: "#898781", fontFamily: "monospace", marginTop: 2, wordBreak: "break-all" },
+  recommendationsList: { display: "flex", flexDirection: "column", gap: 12 },
+  recommendationItem: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "12px 14px" },
+  recommendationType: { fontSize: 12, fontWeight: 600, color: "#0C447C", marginBottom: 6 },
+  recommendationText: { fontSize: 13, lineHeight: 1.5, color: "#52514e" },
+  loginIdDisplay: { fontFamily: "monospace", fontSize: 20, fontWeight: 600, background: "#F1EFE8", border: "1px dashed #c3c2b7", borderRadius: 10, padding: "12px 16px", marginTop: 6, marginBottom: 10, textAlign: "center", wordBreak: "break-all" },
   roleRow: { display: "flex", flexDirection: "column", gap: 8 },
-  radioLabel: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    fontSize: 13,
-    color: "#0b0b0b",
-    cursor: "pointer",
-  },
+  radioLabel: { display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#0b0b0b", cursor: "pointer" },
+  createPatientBtn: { background: "#0F6E56", color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 500, marginLeft: 8 },
+  modalOverlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  modalContent: { background: "#fff", borderRadius: 16, padding: 24, width: "90%", maxWidth: 440, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" },
+  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
+  modalTitle: { margin: 0, fontSize: 18, fontWeight: 600, color: "#0b0b0b" },
+  modalCloseBtn: { background: "none", border: "none", fontSize: 28, cursor: "pointer", color: "#898781", lineHeight: 1, padding: 0 },
+  modalBody: {},
+  formGroup: { marginBottom: 16 },
+  formHint: { fontSize: 11, color: "#898781", fontWeight: 400, marginLeft: 6 },
+  formInput: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #d3d1c7", fontSize: 14, marginTop: 6, boxSizing: "border-box" },
+  modalFooter: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 24 },
+  cancelBtn: { background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#52514e" },
+  createBtn: { background: "#0F6E56", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#fff", fontWeight: 500 },
 };
 
 // ============================================================================
@@ -1837,164 +1607,92 @@ function RegisterScreen({ onRegistered }) {
   const [loginIdInput, setLoginIdInput] = useState("");
   const [justRegistered, setJustRegistered] = useState(null);
   const [hasExactHospitalMatch, setHasExactHospitalMatch] = useState(false);
+  const hospitalInputRef = useRef(null);
 
   useEffect(() => {
     const q = hospitalQuery.trim();
-    if (q.length < 1) {
-      setHospitalMatches([]);
-      setHasExactHospitalMatch(false);
-      return;
-    }
+    if (q.length < 1) { setHospitalMatches([]); setHasExactHospitalMatch(false); return; }
     let cancelled = false;
     const t = setTimeout(() => {
       fetchAllHospitals()
         .then((all) => {
           if (cancelled) return;
-          const filtered = (all || []).filter((h) =>
-            h.Name.toLowerCase().includes(q.toLowerCase())
-          );
+          const filtered = (all || []).filter((h) => h.Name.toLowerCase().includes(q.toLowerCase()));
           setHospitalMatches(filtered.slice(0, 5));
-          setHasExactHospitalMatch(
-            filtered.some((h) => h.Name.trim().toLowerCase() === q.toLowerCase())
-          );
+          setHasExactHospitalMatch(filtered.some((h) => h.Name.trim().toLowerCase() === q.toLowerCase()));
         })
-        .catch(() => {
-          if (!cancelled) {
-            setHospitalMatches([]);
-            setHasExactHospitalMatch(false);
-          }
-        });
+        .catch(() => { if (!cancelled) { setHospitalMatches([]); setHasExactHospitalMatch(false); } });
     }, 250);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
+    return () => { cancelled = true; clearTimeout(t); };
   }, [hospitalQuery]);
+
+  // ✅ Исправлены зависимости useEffect для клика вне
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (hospitalInputRef.current && !hospitalInputRef.current.contains(event.target)) {
+        setHospitalMatches([]);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => { document.removeEventListener("mousedown", handleClickOutside); };
+  }, []);
 
   const isNewHospital = hospitalQuery.trim().length > 0 && !hasExactHospitalMatch;
 
   const handleRegister = async () => {
     setError(null);
-    if (role === "user" && !name.trim()) {
-      setError("Введите имя.");
-      return;
-    }
-    if (!hospitalQuery.trim()) {
-      setError("Укажите больницу.");
-      return;
-    }
+    if (role === "user" && !name.trim()) { setError("Введите имя."); return; }
+    if (!hospitalQuery.trim()) { setError("Укажите больницу."); return; }
     setSubmitting(true);
     try {
       const hospital = await withRetry(() => findOrCreateHospital(hospitalQuery));
       let session;
       if (role === "admin") {
         const admin = await withRetry(() => createAdminUser(hospital.ID));
-        session = {
-          id: admin.ID,
-          loginId: admin.ID,
-          name: null,
-          role: "admin",
-          hospitalId: hospital.ID,
-          hospitalName: hospital.Name,
-        };
+        session = { id: admin.ID, loginId: admin.ID, name: null, role: "admin", hospitalId: hospital.ID, hospitalName: hospital.Name };
       } else {
-        let created = null;
-        let lastErr = null;
+        let created = null; let lastErr = null;
         for (let attempt = 0; attempt < 3 && !created; attempt++) {
-          try {
-            const id = genPatientId();
-            created = await createPatientUser(id, name.trim(), hospital.ID);
-          } catch (e) {
-            lastErr = e;
-          }
+          try { const id = genPatientId(); created = await createPatientUser(id, name.trim(), hospital.ID); }
+          catch (e) { lastErr = e; }
         }
         if (!created) throw lastErr || new Error("network");
-        session = {
-          id: created.ID,
-          loginId: created.ID,
-          name: created.Name,
-          role: "user",
-          hospitalId: hospital.ID,
-          hospitalName: hospital.Name,
-        };
+        session = { id: created.ID, loginId: created.ID, name: created.Name, role: "user", hospitalId: hospital.ID, hospitalName: hospital.Name };
       }
       setJustRegistered(session);
-    } catch (err) {
-      setError(
-        "Не удалось зарегистрироваться — бэкенд недоступен. Проверьте, что сервер запущен и адрес в .env указан верно."
-      );
-    } finally {
-      setSubmitting(false);
-    }
+    } catch (err) { setError("Не удалось зарегистрироваться — бэкенд недоступен."); }
+    finally { setSubmitting(false); }
   };
 
   const handleLoginSubmit = async () => {
     setError(null);
     const raw = loginIdInput.trim();
-    if (!raw) {
-      setError("Введите ID.");
-      return;
-    }
+    if (!raw) { setError("Введите ID."); return; }
     setSubmitting(true);
     try {
       if (/^\d+$/.test(raw)) {
         const user = await fetchPatientUser(raw);
         const hospitalName = await resolveHospitalName(user.HospitalID);
-        onRegistered({
-          id: user.ID,
-          loginId: user.ID,
-          name: user.Name,
-          role: "user",
-          hospitalId: fromNullUUID(user.HospitalID),
-          hospitalName: hospitalName || "—",
-        });
+        onRegistered({ id: user.ID, loginId: user.ID, name: user.Name, role: "user", hospitalId: fromNullUUID(user.HospitalID), hospitalName: hospitalName || "—" });
       } else {
         const admin = await fetchAdmin(raw);
         const hospitalName = await resolveHospitalName(admin.HospitalID);
-        onRegistered({
-          id: admin.ID,
-          loginId: admin.ID,
-          name: null,
-          role: "admin",
-          hospitalId: fromNullUUID(admin.HospitalID),
-          hospitalName: hospitalName || "—",
-        });
+        onRegistered({ id: admin.ID, loginId: admin.ID, name: null, role: "admin", hospitalId: fromNullUUID(admin.HospitalID), hospitalName: hospitalName || "—" });
       }
-    } catch (err) {
-      setError("Пользователь с таким ID не найден.");
-    } finally {
-      setSubmitting(false);
-    }
+    } catch (err) { setError("Пользователь с таким ID не найден."); }
+    finally { setSubmitting(false); }
   };
 
   if (justRegistered) {
     return (
       <div style={styles.page}>
         <div style={{ ...styles.card, maxWidth: 440 }}>
-          <div style={styles.logo}>
-            <div style={styles.logoMark} />
-            <span style={styles.logoText}>Цифровой двойник гликемии</span>
-          </div>
+          <div style={styles.logo}><div style={styles.logoMark} /><span style={styles.logoText}>Цифровой двойник гликемии</span></div>
           <p style={styles.smallMuted}>Регистрация прошла успешно.</p>
-          <div style={styles.formLabel}>
-            {justRegistered.role === "admin" ? "Ваш ID администратора" : "Ваш ID пациента"}
-          </div>
+          <div style={styles.formLabel}>{justRegistered.role === "admin" ? "Ваш ID администратора" : "Ваш ID пациента"}</div>
           <div style={styles.loginIdDisplay}>{justRegistered.loginId}</div>
-          <p style={styles.smallMuted}>
-            Сохраните этот ID — он понадобится, чтобы войти в следующий раз (на
-            вкладке «Войти»).
-          </p>
-          <button
-            style={{
-              ...styles.nutritionAddBtn,
-              width: "100%",
-              marginTop: 20,
-              padding: "10px 0",
-            }}
-            onClick={() => onRegistered(justRegistered)}
-          >
-            Продолжить
-          </button>
+          <p style={styles.smallMuted}>Сохраните этот ID — он понадобится, чтобы войти в следующий раз.</p>
+          <button style={{ ...styles.nutritionAddBtn, width: "100%", marginTop: 20, padding: "10px 0" }} onClick={() => onRegistered(justRegistered)}>Продолжить</button>
         </div>
       </div>
     );
@@ -2003,150 +1701,50 @@ function RegisterScreen({ onRegistered }) {
   return (
     <div style={styles.page}>
       <div style={{ ...styles.card, maxWidth: 440 }}>
-        <div style={styles.logo}>
-          <div style={styles.logoMark} />
-          <span style={styles.logoText}>Цифровой двойник гликемии</span>
-        </div>
-
+        <div style={styles.logo}><div style={styles.logoMark} /><span style={styles.logoText}>Цифровой двойник гликемии</span></div>
         <div style={styles.authTabsRow}>
-          <button
-            style={{
-              ...styles.authTab,
-              ...(mode === "register" ? styles.authTabActive : {}),
-            }}
-            onClick={() => {
-              setMode("register");
-              setError(null);
-            }}
-          >
-            Зарегистрироваться
-          </button>
-          <button
-            style={{
-              ...styles.authTab,
-              ...(mode === "login" ? styles.authTabActive : {}),
-            }}
-            onClick={() => {
-              setMode("login");
-              setError(null);
-            }}
-          >
-            Войти
-          </button>
+          <button style={{ ...styles.authTab, ...(mode === "register" ? styles.authTabActive : {}) }} onClick={() => { setMode("register"); setError(null); }}>Зарегистрироваться</button>
+          <button style={{ ...styles.authTab, ...(mode === "login" ? styles.authTabActive : {}) }} onClick={() => { setMode("login"); setError(null); }}>Войти</button>
         </div>
-
         {error && <div style={styles.errorBanner}>{error}</div>}
-
         {mode === "login" ? (
           <>
-            <p style={styles.smallMuted}>
-              Пациенты входят по короткому числовому ID, администраторы — по
-              своему UUID. Оба выдаются один раз при регистрации.
-            </p>
+            <p style={styles.smallMuted}>Пациенты входят по короткому числовому ID, администраторы — по UUID.</p>
             <div style={{ marginTop: 12 }}>
               <div style={styles.formLabel}>Ваш ID</div>
-              <input
-                type="text"
-                value={loginIdInput}
-                onChange={(e) => setLoginIdInput(e.target.value)}
-                placeholder="Например, 482913 или UUID"
-                style={styles.nutritionInput}
-              />
+              <input type="text" value={loginIdInput} onChange={(e) => setLoginIdInput(e.target.value)} placeholder="Например, 482913 или UUID" style={styles.nutritionInput} />
             </div>
-            <button
-              style={{
-                ...styles.nutritionAddBtn,
-                width: "100%",
-                marginTop: 16,
-                padding: "10px 0",
-              }}
-              onClick={handleLoginSubmit}
-            >
-              Войти
-            </button>
+            <button style={{ ...styles.nutritionAddBtn, width: "100%", marginTop: 16, padding: "10px 0" }} onClick={handleLoginSubmit}>Войти</button>
           </>
         ) : (
           <>
-            <p style={styles.smallMuted}>
-              Регистрация нужна один раз — дальше вход будет запоминаться в этом
-              браузере (или заходи через вкладку «Войти»).
-            </p>
-
+            <p style={styles.smallMuted}>Регистрация нужна один раз — дальше вход будет запоминаться в этом браузере.</p>
             {role === "user" && (
               <div style={{ marginTop: 16 }}>
                 <div style={styles.formLabel}>Имя</div>
-                <input
-                  type="text"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Например, Мария Иванова"
-                  style={styles.nutritionInput}
-                />
+                <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Например, Мария Иванова" style={styles.nutritionInput} />
               </div>
             )}
-
             <div style={{ marginTop: 14 }}>
               <div style={styles.formLabel}>Роль</div>
               <div style={styles.roleRow}>
-                <label style={styles.radioLabel}>
-                  <input
-                    type="radio"
-                    checked={role === "user"}
-                    onChange={() => setRole("user")}
-                  />
-                  Пациент 
-                </label>
-                <label style={styles.radioLabel}>
-                  <input
-                    type="radio"
-                    checked={role === "admin"}
-                    onChange={() => setRole("admin")}
-                  />
-                  Администратор
-                </label>
+                <label style={styles.radioLabel}><input type="radio" checked={role === "user"} onChange={() => setRole("user")} /> Пациент</label>
+                <label style={styles.radioLabel}><input type="radio" checked={role === "admin"} onChange={() => setRole("admin")} /> Администратор</label>
               </div>
             </div>
-
-            <div style={{ marginTop: 14, position: "relative" }}>
+            <div style={{ marginTop: 14, position: "relative" }} ref={hospitalInputRef}>
               <div style={styles.formLabel}>Больница</div>
-              <input
-                type="text"
-                value={hospitalQuery}
-                onChange={(e) => setHospitalQuery(e.target.value)}
-                placeholder="Начните вводить название"
-                style={styles.nutritionInput}
-              />
+              <input type="text" value={hospitalQuery} onChange={(e) => setHospitalQuery(e.target.value)} placeholder="Начните вводить название" style={styles.nutritionInput} />
               {hospitalQuery && hospitalMatches.length > 0 && (
                 <div style={styles.suggestList}>
                   {hospitalMatches.map((h) => (
-                    <div
-                      key={h.ID}
-                      style={styles.suggestItem}
-                      onClick={() => setHospitalQuery(h.Name)}
-                    >
-                      {h.Name}
-                    </div>
+                    <div key={h.ID} style={styles.suggestItem} onClick={() => { setHospitalQuery(h.Name); setHospitalMatches([]); }}>{h.Name}</div>
                   ))}
                 </div>
               )}
-              {isNewHospital && (
-                <div style={styles.smallMuted}>
-                  Такой больницы ещё нет — будет создана новая: «
-                  {hospitalQuery.trim()}»
-                </div>
-              )}
+              {isNewHospital && <div style={styles.smallMuted}>Такой больницы ещё нет — будет создана новая: «{hospitalQuery.trim()}»</div>}
             </div>
-
-            <button
-              style={{
-                ...styles.nutritionAddBtn,
-                width: "100%",
-                marginTop: 20,
-                padding: "10px 0",
-              }}
-              onClick={handleRegister}
-              disabled={submitting}
-            >
+            <button style={{ ...styles.nutritionAddBtn, width: "100%", marginTop: 20, padding: "10px 0" }} onClick={handleRegister} disabled={submitting}>
               {submitting ? "Регистрируем..." : "Зарегистрироваться"}
             </button>
           </>
@@ -2164,23 +1762,8 @@ export default function GlucoseDashboardApp() {
   const [session, setSession] = useState(() => loadSession());
 
   if (!session) {
-    return (
-      <RegisterScreen
-        onRegistered={(s) => {
-          saveSession(s);
-          setSession(s);
-        }}
-      />
-    );
+    return <RegisterScreen onRegistered={(s) => { saveSession(s); setSession(s); }} />;
   }
 
-  return (
-    <Dashboard
-      session={session}
-      onLogout={() => {
-        clearSession();
-        setSession(null);
-      }}
-    />
-  );
+  return <Dashboard session={session} onLogout={() => { clearSession(); setSession(null); }} />;
 }
