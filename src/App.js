@@ -680,7 +680,12 @@ const [patientId, setPatientId] = useState(null);
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
-              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
+              <ForecastCard 
+  model={MODELS.nn} 
+  forecast={forecastNN} 
+  loading={loading} 
+  modelStatus={!forecastNN && !loading ? 'training' : undefined}
+/>
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
 
@@ -845,11 +850,31 @@ function GlucoseCard({ latest, loading }) {
   );
 }
 
-function ForecastCard({ model, forecast, loading }) {
+function ForecastCard({ model, forecast, loading, modelStatus }) {
   return (
     <div style={styles.statCard}>
       <div style={styles.statCardLabel}>Прогноз</div>
-      {loading || !forecast ? (
+      {loading ? (
+        <div style={styles.skeleton} />
+      ) : !forecast && modelStatus === 'training' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>
+            Ожидаю обучение
+          </span>
+          <div style={styles.smallMuted}>
+            Модель ещё не готова к прогнозам
+          </div>
+        </>
+      ) : !forecast && modelStatus === 'not_ready' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>
+            Не готов
+          </span>
+          <div style={styles.smallMuted}>
+            Нет данных для прогноза
+          </div>
+        </>
+      ) : !forecast ? (
         <div style={styles.skeleton} />
       ) : (
         <>
