@@ -618,8 +618,7 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
   useEffect(() => {
     const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [whatIf, history]);
+  }, [whatIf, history, runWhatIf]);
   // Закрытие списка больниц при клике вне
   useEffect(() => {
     function handleClickOutside(event) {
@@ -634,7 +633,8 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
     };
-  }, []);
+  }, [hospitalInputRef]);
+
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
       t: d.t,
