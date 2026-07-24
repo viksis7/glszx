@@ -696,14 +696,14 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
   return (
     <div style={styles.page}>
       <div style={styles.card}>
-        <Header
+      <Header
           patient={patient}
           patients={patients}
           onPatientChange={setPatientId}
           connected={connected}
           session={session}
           onLogout={onLogout}
-          onCreatePatient={() => setShowCreatePatient(true)}
+          onCreatePatient={() => setShowCreatePatient(true)} 
         />
 
         {!patientsLoaded ? (
@@ -780,6 +780,39 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
             />
           </>
         )}
+        {showCreatePatient && (
+          <div style={styles.modalOverlay}>
+            <div style={styles.modalContent}>
+              <div style={styles.modalHeader}>
+                <h3 style={styles.modalTitle}>Создание нового пациента</h3>
+                <button style={styles.modalCloseBtn} onClick={() => setShowCreatePatient(false)}>×</button>
+              </div>
+              
+              <div style={styles.modalBody}>
+                {createPatientError && <div style={styles.errorBanner}>{createPatientError}</div>}
+                
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Имя пациента</label>
+                  <input type="text" value={newPatientName} onChange={(e) => setNewPatientName(e.target.value)} placeholder="Например, Иван Петров" style={styles.formInput} autoFocus />
+                </div>
+                
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>ID пациента (6 цифр)</label>
+                  <input type="text" value={newPatientId} onChange={(e) => setNewPatientId(e.target.value.replace(/\D/g, ''))} placeholder="123456" maxLength={6} style={styles.formInput} />
+                </div>
+                
+                <div style={styles.modalFooter}>
+                  <button style={styles.cancelBtn} onClick={() => setShowCreatePatient(false)} disabled={creatingPatient}>Отмена</button>
+                  <button style={styles.createBtn} onClick={handleCreatePatient} disabled={creatingPatient || !newPatientName.trim() || !newPatientId.trim()}>
+                    {creatingPatient ? "Создание..." : "Создать"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <Footer />
 
         <Footer />
       </div>
@@ -791,7 +824,7 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
 // Подкомпоненты
 // ============================================================================
 
-function Header({ patient, patients, onPatientChange, connected, session, onLogout }) {
+function Header({ patient, patients, onPatientChange, connected, session, onLogout, onCreatePatient }) {
   return (
     <div style={styles.header}>
       <div style={styles.logo}>
@@ -807,15 +840,17 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
-  {/* ✨ НОВАЯ СТРОКА: кнопка для администратора */}
-  {session.role === "admin" && (
-    <button 
-      style={styles.createPatientBtn}
-      onClick={onCreatePatient}
-    >
-      + Создать пациента
-    </button>
-  )}
+        {session.role === "admin" && (
+          <button 
+            style={styles.createPatientBtn}
+            onClick={() => {
+              console.log('Кнопка нажата'); // Для проверки
+              onCreatePatient();
+            }}
+          >
+            + Создать пациента
+          </button>
+        )}
 
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
@@ -1978,6 +2013,19 @@ const styles = {
     color: "#0b0b0b",
     cursor: "pointer",
   },
+  createPatientBtn: { background: "#0F6E56", color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 500, marginLeft: 8 },
+  modalOverlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  modalContent: { background: "#fff", borderRadius: 16, padding: 24, width: "90%", maxWidth: 440, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" },
+  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
+  modalTitle: { margin: 0, fontSize: 18, fontWeight: 600, color: "#0b0b0b" },
+  modalCloseBtn: { background: "none", border: "none", fontSize: 28, cursor: "pointer", color: "#898781", lineHeight: 1, padding: 0 },
+  modalBody: {},
+  formGroup: { marginBottom: 16 },
+  formLabel: { fontSize: 13, fontWeight: 500, marginBottom: 6, color: "#52514e" },
+  formInput: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #d3d1c7", fontSize: 14, marginTop: 6, boxSizing: "border-box" },
+  modalFooter: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 24 },
+  cancelBtn: { background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#52514e" },
+  createBtn: { background: "#0F6E56", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#fff", fontWeight: 500 },
 };
 
 // ============================================================================
