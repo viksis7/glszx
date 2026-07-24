@@ -98,7 +98,9 @@ async function findOrCreateHospital(name) {
 }
 
 function toNullUUID(uuidStr) {
-  return uuidStr || null;
+  return uuidStr
+    ? { UUID: uuidStr, Valid: true }
+    : { UUID: "00000000-0000-0000-0000-000000000000", Valid: false };
 }
 function fromNullUUID(value) {
   if (value == null) return null;
@@ -127,7 +129,11 @@ async function createPatientUser(id, name, hospitalId) {
   return apiFetch("/user", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, name, hospital_id: toNullUUID(hospitalId) }),
+    body: JSON.stringify({ 
+      id: parseInt(id, 10),  // ← конвертируем строку в число
+      name, 
+      hospital_id: toNullUUID(hospitalId) 
+    }),
   });
 }
 async function fetchPatientUser(patientId) {
@@ -146,9 +152,6 @@ async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
 }
 
-async function fetchRecommendations(patientId) {
-  return apiFetch(`/recommendations/${patientId}`);
-}
 function buildHistory(readings) {
   return [...(readings || [])]
     .map((r) => ({
@@ -188,11 +191,23 @@ function latestReadingFrom(history) {
 }
 
 function latestForecastFrom(predictions) {
-  const sorted = [...(predictions || [])].sort(
-    (a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted)
+  if (!predictions || predictions.length === 0) return null;
+
+  const now = Date.now();
+
+  // Оставляем только прогнозы на БУДУЩЕЕ (после текущего момента)
+  const future = predictions
+    .filter((p) => new Date(p.TimePredicted).getTime() > now)
+    .sort((a, b) => new Date(a.TimePredicted) - new Date(b.TimePredicted));
+
+  // Если будущих нет — берём самый поздний из всех (последний сделанный)
+  const list = future.length > 0 ? future : [...predictions].sort(
+    (a, b) => new Date(b.TimePredicted) - new Date(a.TimePredicted)
   );
-  if (sorted.length === 0) return null;
-  const next = sorted[0];
+
+  if (list.length === 0) return null;
+
+  const next = list[0]; // теперь это ближайшее будущее значение
   const value = toNum(next.GlucosePredicted);
   if (value == null) return null;
   return { value, forecastFor: next.TimePredicted };
@@ -469,7 +484,6 @@ const [patientId, setPatientId] = useState(null);
   const [snapshot, setSnapshot] = useState(null);
   const [debugOverride, setDebugOverride] = useState("");
   const [nutritionLog, setNutritionLog] = useState([]);
-  const [recommendations, setRecommendations] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -477,13 +491,7 @@ const [patientId, setPatientId] = useState(null);
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
-const [showCreatePatient, setShowCreatePatient] = useState(false);
-const [newPatientName, setNewPatientName] = useState("");
-const [newPatientId, setNewPatientId] = useState("");
-const [creatingPatient, setCreatingPatient] = useState(false);
-const [createPatientError, setCreatePatientError] = useState(null);
-
-const patient = patients.find((p) => String(p.id) === String(patientId)) || patients[0] || null;
+  const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
   const pollRef = useRef(null);
 
   const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
@@ -525,14 +533,12 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
       return;
     }
     try {
-      const [snapshotRes, nutritionRes, recommendationsRes] = await Promise.all([
+      const [snapshotRes, nutritionRes] = await Promise.all([
         withRetry(() => fetchPatientSnapshot(patientId, currentPeriod)),
         withRetry(() => fetchNutritionLog(patientId)),
-        withRetry(() => fetchRecommendations(patientId)),
       ]);
       setSnapshot(snapshotRes);
       setNutritionLog(nutritionRes);
-      setRecommendations(recommendationsRes);
       setConnected(true);
       setError(null);
     } catch (err) {
@@ -542,43 +548,6 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
       setLoading(false);
     }
   }, [patientId, currentPeriod]);
-
-  const handleCreatePatient = async () => {
-    if (!newPatientName.trim() || !newPatientId.trim()) {
-      setCreatePatientError("Заполните имя и ID пациента");
-      return;
-    }
-  
-    setCreatingPatient(true);
-    setCreatePatientError(null);
-  
-    try {
-      // Получаем hospitalId из сессии
-      const hospitalId = session.hospitalId;
-      
-      // Создаём пациента
-      const created = await createPatientUser(
-        newPatientId.trim(),
-        newPatientName.trim(),
-        hospitalId
-      );
-  
-      // Добавляем в список пациентов
-      setPatients(prev => [...prev, { id: created.ID, name: created.Name }]);
-      
-      // Очищаем форму и закрываем модалку
-      setNewPatientName("");
-      setNewPatientId("");
-      setShowCreatePatient(false);
-      
-      // Выбираем созданного пациента
-      setPatientId(created.ID);
-    } catch (err) {
-      setCreatePatientError("Не удалось создать пациента. Возможно, ID уже занят.");
-    } finally {
-      setCreatingPatient(false);
-    }
-  };
 
   useEffect(() => {
     setLoading(true);
@@ -618,22 +587,8 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
   useEffect(() => {
     const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
-  }, [whatIf, history, runWhatIf]);
-  // Закрытие списка больниц при клике вне
-  useEffect(() => {
-    function handleClickOutside(event) {
-      if (
-        hospitalInputRef.current &&
-        !hospitalInputRef.current.contains(event.target)
-      ) {
-        setHospitalMatches([]);
-      }
-    }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
-    };
-  }, [hospitalInputRef]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [whatIf, history]);
 
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
@@ -696,14 +651,13 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
   return (
     <div style={styles.page}>
       <div style={styles.card}>
-      <Header
+        <Header
           patient={patient}
           patients={patients}
           onPatientChange={setPatientId}
           connected={connected}
           session={session}
           onLogout={onLogout}
-          onCreatePatient={() => setShowCreatePatient(true)} 
         />
 
         {!patientsLoaded ? (
@@ -730,22 +684,9 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
-              <ForecastCard 
-                model={MODELS.nn} 
-                forecast={forecastNN} 
-                loading={loading} 
-                modelStatus={!forecastNN && !loading ? 'training' : undefined}
-              />
+              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
-
-            {/* ✅ РЕКОМЕНДАЦИИ ТЕПЕРЬ ЗДЕСЬ, СРАЗУ ПОСЛЕ ПРОГНОЗОВ */}
-            <RecommendationsPanel 
-              recommendations={recommendations} 
-              loading={loading} 
-            />
-
-            {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
             {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
@@ -776,41 +717,13 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
               />
               <Statistics stats={stats} loading={loading} />
             </div>
+
+            <FullHistoryTable
+              history={fullHistory}
+              onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
+            />
           </>
         )}
-        {showCreatePatient && (
-          <div style={styles.modalOverlay}>
-            <div style={styles.modalContent}>
-              <div style={styles.modalHeader}>
-                <h3 style={styles.modalTitle}>Создание нового пациента</h3>
-                <button style={styles.modalCloseBtn} onClick={() => setShowCreatePatient(false)}>×</button>
-              </div>
-              
-              <div style={styles.modalBody}>
-                {createPatientError && <div style={styles.errorBanner}>{createPatientError}</div>}
-                
-                <div style={styles.formGroup}>
-                  <label style={styles.formLabel}>Имя пациента</label>
-                  <input type="text" value={newPatientName} onChange={(e) => setNewPatientName(e.target.value)} placeholder="Например, Иван Петров" style={styles.formInput} autoFocus />
-                </div>
-                
-                <div style={styles.formGroup}>
-                  <label style={styles.formLabel}>ID пациента (6 цифр)</label>
-                  <input type="text" value={newPatientId} onChange={(e) => setNewPatientId(e.target.value.replace(/\D/g, ''))} placeholder="123456" maxLength={6} style={styles.formInput} />
-                </div>
-                
-                <div style={styles.modalFooter}>
-                  <button style={styles.cancelBtn} onClick={() => setShowCreatePatient(false)} disabled={creatingPatient}>Отмена</button>
-                  <button style={styles.createBtn} onClick={handleCreatePatient} disabled={creatingPatient || !newPatientName.trim() || !newPatientId.trim()}>
-                    {creatingPatient ? "Создание..." : "Создать"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <Footer />
 
         <Footer />
       </div>
@@ -822,7 +735,7 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
 // Подкомпоненты
 // ============================================================================
 
-function Header({ patient, patients, onPatientChange, connected, session, onLogout, onCreatePatient }) {
+function Header({ patient, patients, onPatientChange, connected, session, onLogout }) {
   return (
     <div style={styles.header}>
       <div style={styles.logo}>
@@ -838,29 +751,17 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
-        {session.role === "admin" && (
-          <button 
-            style={styles.createPatientBtn}
-            onClick={() => {
-              console.log('Кнопка нажата'); // Для проверки
-              onCreatePatient();
-            }}
-          >
-            + Создать пациента
-          </button>
-        )}
-
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
             Пациент:
             {patients.length === 0 ? (
               <span style={styles.smallMuted}> нет пациентов</span>
             ) : (
-            <select
-            value={String(patient?.id ?? "")}
-            onChange={(e) => onPatientChange(e.target.value)}
-            style={styles.select}
-            >
+              <select
+                value={patient?.id ?? ""}
+                onChange={(e) => onPatientChange(e.target.value)}
+                style={styles.select}
+              >
                 {patients.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
@@ -948,31 +849,16 @@ function GlucoseCard({ latest, loading }) {
   );
 }
 
-function ForecastCard({ model, forecast, loading, modelStatus }) {
+function ForecastCard({ model, forecast, loading }) {
   return (
     <div style={styles.statCard}>
-      <div style={styles.statCardLabel}>Прогноз</div>
-      {loading ? (
-        <div style={styles.skeleton} />
-      ) : !forecast && modelStatus === 'training' ? (
-        <>
-          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>
-            Ожидаю обучение
-          </span>
-          <div style={styles.smallMuted}>
-            Модель ещё не готова к прогнозам
-          </div>
-        </>
-      ) : !forecast && modelStatus === 'not_ready' ? (
-        <>
-          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>
-            Не готов
-          </span>
-          <div style={styles.smallMuted}>
-            Нет данных для прогноза
-          </div>
-        </>
-      ) : !forecast ? (
+     <div style={styles.statCardLabel}>
+  Прогноз
+  <span style={{ ...styles.modelTag, color: model.color }}>
+    {" "}· {model.label}
+  </span>
+</div>
+      {loading || !forecast ? (
         <div style={styles.skeleton} />
       ) : (
         <>
@@ -1393,61 +1279,6 @@ function Statistics({ stats, loading }) {
           <StatRow label="Время в диапазоне" value={`${stats.timeInRange}%`} />
         </div>
       )}
-    </div>
-  );
-}
-
-function RecommendationsPanel({ recommendations, loading }) {
-  if (loading) {
-    return (
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Рекомендации</div>
-        <div style={styles.skeleton} />
-      </div>
-    );
-  }
-
-  if (!recommendations) {
-    return (
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Рекомендации</div>
-        <div style={styles.smallMuted}>Нет рекомендаций</div>
-      </div>
-    );
-  }
-
-  // Предполагаем, что бэкенд возвращает объект с полями:
-  // { nutrition: "...", activity: "...", insulin: "...", general: "..." }
-  // или массив рекомендаций: [{ type: "nutrition", text: "..." }, ...]
-  
-  const items = Array.isArray(recommendations) 
-    ? recommendations 
-    : Object.entries(recommendations).map(([key, value]) => ({
-        type: key,
-        text: value,
-      }));
-
-  const typeLabels = {
-    nutrition: " Питание",
-    activity: " Активность",
-    insulin: " Инсулин",
-    general: " Общие",
-    monitoring: " Мониторинг",
-  };
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelTitle}>Рекомендации</div>
-      <div style={styles.recommendationsList}>
-        {items.map((item, index) => (
-          <div key={index} style={styles.recommendationItem}>
-            <div style={styles.recommendationType}>
-              {typeLabels[item.type] || item.type}
-            </div>
-            <div style={styles.recommendationText}>{item.text}</div>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }
@@ -1967,28 +1798,6 @@ const styles = {
     marginTop: 2,
     wordBreak: "break-all",
   },
-  recommendationsList: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 12,
-  },
-  recommendationItem: {
-    background: "#F7F6F2",
-    border: "1px solid #e1e0d9",
-    borderRadius: 10,
-    padding: "12px 14px",
-  },
-  recommendationType: {
-    fontSize: 12,
-    fontWeight: 600,
-    color: "#0C447C",
-    marginBottom: 6,
-  },
-  recommendationText: {
-    fontSize: 13,
-    lineHeight: 1.5,
-    color: "#52514e",
-  },
   loginIdDisplay: {
     fontFamily: "monospace",
     fontSize: 20,
@@ -2011,19 +1820,6 @@ const styles = {
     color: "#0b0b0b",
     cursor: "pointer",
   },
-  createPatientBtn: { background: "#0F6E56", color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 500, marginLeft: 8 },
-  modalOverlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
-  modalContent: { background: "#fff", borderRadius: 16, padding: 24, width: "90%", maxWidth: 440, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" },
-  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
-  modalTitle: { margin: 0, fontSize: 18, fontWeight: 600, color: "#0b0b0b" },
-  modalCloseBtn: { background: "none", border: "none", fontSize: 28, cursor: "pointer", color: "#898781", lineHeight: 1, padding: 0 },
-  modalBody: {},
-  formGroup: { marginBottom: 16 },
-  formLabel: { fontSize: 13, fontWeight: 500, marginBottom: 6, color: "#52514e" },
-  formInput: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #d3d1c7", fontSize: 14, marginTop: 6, boxSizing: "border-box" },
-  modalFooter: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 24 },
-  cancelBtn: { background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#52514e" },
-  createBtn: { background: "#0F6E56", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#fff", fontWeight: 500 },
 };
 
 // ============================================================================
@@ -2041,7 +1837,6 @@ function RegisterScreen({ onRegistered }) {
   const [loginIdInput, setLoginIdInput] = useState("");
   const [justRegistered, setJustRegistered] = useState(null);
   const [hasExactHospitalMatch, setHasExactHospitalMatch] = useState(false);
-  const hospitalInputRef = useRef(null);
 
   useEffect(() => {
     const q = hospitalQuery.trim();
@@ -2312,37 +2107,35 @@ function RegisterScreen({ onRegistered }) {
               </div>
             </div>
 
-            <div style={{ marginTop: 14, position: "relative" }} ref={hospitalInputRef}>
-  <div style={styles.formLabel}>Больница</div>
-  <input
-    type="text"
-    value={hospitalQuery}
-    onChange={(e) => setHospitalQuery(e.target.value)}
-    placeholder="Начните вводить название"
-    style={styles.nutritionInput}
-  />
-  {hospitalQuery && hospitalMatches.length > 0 && (
-    <div style={styles.suggestList}>
-      {hospitalMatches.map((h) => (
-        <div
-          key={h.ID}
-          style={styles.suggestItem}
-          onClick={() => {
-            setHospitalQuery(h.Name);
-            setHospitalMatches([]);
-          }}
-        >
-          {h.Name}
-        </div>
-      ))}
-    </div>
-  )}
-  {isNewHospital && (
-    <div style={styles.smallMuted}>
-      Такой больницы ещё нет — будет создана новая: «{hospitalQuery.trim()}»
-    </div>
-  )}
-</div>
+            <div style={{ marginTop: 14, position: "relative" }}>
+              <div style={styles.formLabel}>Больница</div>
+              <input
+                type="text"
+                value={hospitalQuery}
+                onChange={(e) => setHospitalQuery(e.target.value)}
+                placeholder="Начните вводить название"
+                style={styles.nutritionInput}
+              />
+              {hospitalQuery && hospitalMatches.length > 0 && (
+                <div style={styles.suggestList}>
+                  {hospitalMatches.map((h) => (
+                    <div
+                      key={h.ID}
+                      style={styles.suggestItem}
+                      onClick={() => setHospitalQuery(h.Name)}
+                    >
+                      {h.Name}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {isNewHospital && (
+                <div style={styles.smallMuted}>
+                  Такой больницы ещё нет — будет создана новая: «
+                  {hospitalQuery.trim()}»
+                </div>
+              )}
+            </div>
 
             <button
               style={{
