@@ -98,9 +98,7 @@ async function findOrCreateHospital(name) {
 }
 
 function toNullUUID(uuidStr) {
-  return uuidStr
-    ? { UUID: uuidStr, Valid: true }
-    : { UUID: "00000000-0000-0000-0000-000000000000", Valid: false };
+  return uuidStr || null;
 }
 function fromNullUUID(value) {
   if (value == null) return null;
@@ -460,7 +458,7 @@ const [patientId, setPatientId] = useState(null);
     if (patients.length > 0 && patientId === null) {
       setPatientId(patients[0].id);
     }
-  }, [patients]);  
+  }, [patients]);  // ← убрали patientId из зависимостей
 
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
@@ -569,10 +567,25 @@ const [patientId, setPatientId] = useState(null);
   );
 
   useEffect(() => {
-    const t = setTimeout(() => runWhatIf(whatIf), 250); 
+    const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
-  }, [whatIf, history, runWhatIf]);
-
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [whatIf, history]);
+  // Закрытие списка больниц при клике вне
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (
+        hospitalInputRef.current &&
+        !hospitalInputRef.current.contains(event.target)
+      ) {
+        setHospitalMatches([]);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
       t: d.t,
@@ -1815,6 +1828,7 @@ function RegisterScreen({ onRegistered }) {
   const [loginIdInput, setLoginIdInput] = useState("");
   const [justRegistered, setJustRegistered] = useState(null);
   const [hasExactHospitalMatch, setHasExactHospitalMatch] = useState(false);
+  const hospitalInputRef = useRef(null);
 
   useEffect(() => {
     const q = hospitalQuery.trim();
@@ -2085,35 +2099,37 @@ function RegisterScreen({ onRegistered }) {
               </div>
             </div>
 
-            <div style={{ marginTop: 14, position: "relative" }}>
-              <div style={styles.formLabel}>Больница</div>
-              <input
-                type="text"
-                value={hospitalQuery}
-                onChange={(e) => setHospitalQuery(e.target.value)}
-                placeholder="Начните вводить название"
-                style={styles.nutritionInput}
-              />
-              {hospitalQuery && hospitalMatches.length > 0 && (
-                <div style={styles.suggestList}>
-                  {hospitalMatches.map((h) => (
-                    <div
-                      key={h.ID}
-                      style={styles.suggestItem}
-                      onClick={() => setHospitalQuery(h.Name)}
-                    >
-                      {h.Name}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {isNewHospital && (
-                <div style={styles.smallMuted}>
-                  Такой больницы ещё нет — будет создана новая: «
-                  {hospitalQuery.trim()}»
-                </div>
-              )}
-            </div>
+            <div style={{ marginTop: 14, position: "relative" }} ref={hospitalInputRef}>
+  <div style={styles.formLabel}>Больница</div>
+  <input
+    type="text"
+    value={hospitalQuery}
+    onChange={(e) => setHospitalQuery(e.target.value)}
+    placeholder="Начните вводить название"
+    style={styles.nutritionInput}
+  />
+  {hospitalQuery && hospitalMatches.length > 0 && (
+    <div style={styles.suggestList}>
+      {hospitalMatches.map((h) => (
+        <div
+          key={h.ID}
+          style={styles.suggestItem}
+          onClick={() => {
+            setHospitalQuery(h.Name);
+            setHospitalMatches([]);
+          }}
+        >
+          {h.Name}
+        </div>
+      ))}
+    </div>
+  )}
+  {isNewHospital && (
+    <div style={styles.smallMuted}>
+      Такой больницы ещё нет — будет создана новая: «{hospitalQuery.trim()}»
+    </div>
+  )}
+</div>
 
             <button
               style={{
