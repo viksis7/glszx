@@ -731,13 +731,21 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
               <ForecastCard 
-  model={MODELS.nn} 
-  forecast={forecastNN} 
-  loading={loading} 
-  modelStatus={!forecastNN && !loading ? 'training' : undefined}
-/>
+                model={MODELS.nn} 
+                forecast={forecastNN} 
+                loading={loading} 
+                modelStatus={!forecastNN && !loading ? 'training' : undefined}
+              />
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
+
+            {/* ✅ РЕКОМЕНДАЦИИ ТЕПЕРЬ ЗДЕСЬ, СРАЗУ ПОСЛЕ ПРОГНОЗОВ */}
+            <RecommendationsPanel 
+              recommendations={recommendations} 
+              loading={loading} 
+            />
+
+            {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
             {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
@@ -768,16 +776,6 @@ const patient = patients.find((p) => String(p.id) === String(patientId)) || pati
               />
               <Statistics stats={stats} loading={loading} />
             </div>
-
-  <RecommendationsPanel 
-  recommendations={recommendations} 
-  loading={loading} 
-/>
-
-            <FullHistoryTable
-              history={fullHistory}
-              onExport={() => downloadCsv(fullHistory.map((d) => ({ ...d, forecastNN: null, forecastODE: null })), patient.name)}
-            />
           </>
         )}
         {showCreatePatient && (
