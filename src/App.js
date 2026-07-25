@@ -147,6 +147,9 @@ async function resolveHospitalName(hospitalIdRaw) {
 async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
 }
+async function fetchRecommendations(patientId) {
+  return apiFetch(`/recommendations/${patientId}`);
+}
 
 function buildHistory(readings) {
   return [...(readings || [])]
@@ -734,7 +737,7 @@ const [patientId, setPatientId] = useState(null);
               yDomain={yDomain}
               rangeKey={rangeKey}
               loading={loading}
-              onExport={() => downloadCss(chartData, patient.name)}
+              onExport={() => downloadCsv(chartData, patient.name)}
               nowLabel={
                 history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
               }
