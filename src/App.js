@@ -505,6 +505,8 @@ const [patientId, setPatientId] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  const [recommendations, setRecommendations] = useState(null);
+
   const [whatIf, setWhatIf] = useState({ carbsG: 0, proteinG: 0, activityMin: 0 });
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
@@ -562,9 +564,22 @@ const [patientId, setPatientId] = useState(null);
     } catch (err) {
       setConnected(false);
       setError("Не удалось получить данные с сервера.");
-    } finally {
-      setLoading(false);
     }
+
+    // Загружаем рекомендации отдельно
+    try {
+      const recommendationsRes = await withRetry(() => fetchRecommendations(patientId));
+      setRecommendations(recommendationsRes);
+    } catch (err) {
+      // Демо-данные, если бэкенд пока не готов
+      setRecommendations({
+        nutrition: "Рекомендуется соблюдать режим питания. Ограничьте быстрые углеводы.",
+        activity: "Добавьте 30 минут лёгкой физической активности в день.",
+        general: "Продолжайте регулярный мониторинг глюкозы.",
+      });
+    }
+
+    setLoading(false);
   }, [patientId, currentPeriod]);
 
   useEffect(() => {
@@ -699,12 +714,51 @@ const [patientId, setPatientId] = useState(null);
             )}
 
             <DebugPanel value={debugOverride} onChange={setDebugOverride} />
+            function RecommendationsPanel({ recommendations, loading }) {
+  if (loading) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.skeleton} />
+      </div>
+    );
+  }
+  if (!recommendations) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.smallMuted}>Нет рекомендаций</div>
+      </div>
+    );
+  }
+  const items = Array.isArray(recommendations)
+    ? recommendations
+    : Object.entries(recommendations).map(([key, value]) => ({ type: key, text: value }));
+  const typeLabels = { nutrition: "🍎 Питание", activity: "🏃 Активность", insulin: "💉 Инсулин", general: "📋 Общие", monitoring: "📊 Мониторинг" };
+  
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Рекомендации</div>
+      <div style={styles.recommendationsList}>
+        {items.map((item, index) => (
+          <div key={index} style={styles.recommendationItem}>
+            <div style={styles.recommendationType}>{typeLabels[item.type] || item.type}</div>
+            <div style={styles.recommendationText}>{item.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
-              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} />
+              <ForecastCard model={MODELS.nn} forecast={forecastNN} loading={loading} modelStatus={!forecastNN && !loading ? 'training' : undefined} />
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
+
+            {/* ✅ ПАНЕЛЬ РЕКОМЕНДАЦИЙ */}
+            <RecommendationsPanel recommendations={recommendations} loading={loading} />
 
             {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
@@ -867,11 +921,28 @@ function GlucoseCard({ latest, loading }) {
   );
 }
 
-function ForecastCard({ model, forecast, loading }) {
+function ForecastCard({ model, forecast, loading, modelStatus }) {
   return (
     <div style={styles.statCard}>
-      <div style={styles.statCardLabel}>Прогноз</div>
-      {loading || !forecast ? (
+      <div style={styles.statCardLabel}>
+        Прогноз
+        <span style={{ ...styles.modelTag, color: model.color }}>
+          {" "}· {model.label}
+        </span>
+      </div>
+      {loading ? (
+        <div style={styles.skeleton} />
+      ) : !forecast && modelStatus === 'training' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Ожидаю обучение</span>
+          <div style={styles.smallMuted}>Модель ещё не готова к прогнозам</div>
+        </>
+      ) : !forecast && modelStatus === 'not_ready' ? (
+        <>
+          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Не готов</span>
+          <div style={styles.smallMuted}>Нет данных для прогноза</div>
+        </>
+      ) : !forecast ? (
         <div style={styles.skeleton} />
       ) : (
         <>
@@ -1374,6 +1445,11 @@ const styles = {
     display: "flex",
     justifyContent: "center",
   },
+  recommendationsList: { display: "flex", flexDirection: "column", gap: 12 },
+  recommendationItem: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "12px 14px" },
+  recommendationType: { fontSize: 12, fontWeight: 600, color: "#0C447C", marginBottom: 6 },
+  recommendationText: { fontSize: 13, lineHeight: 1.5, color: "#52514e" },
+  
   card: {
     width: "100%",
     maxWidth: 960,
