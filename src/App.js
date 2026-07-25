@@ -12,8 +12,7 @@ import {
   ReferenceLine,
 } from "recharts";
 
-const TARGET_RANGE = { low: 3.9, high: 10.0 }; // ммоль/л, из отчета п.1.4
-
+const TARGET_RANGE = { low: 3.9, high: 10.0 };
 const API_BASE = process.env.REACT_APP_API_BASE_URL;
 
 const RANGE_OPTIONS = [
@@ -40,51 +39,47 @@ function loadJSON(key, fallback) {
   }
 }
 function saveJSON(key, value) {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // localStorage недоступен (приватный режим и т.п.) — молча игнорируем.
-  }
+  try { window.localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
-function loadSession() {
-  return loadJSON(LS_SESSION_KEY, null);
-}
-function saveSession(session) {
-  saveJSON(LS_SESSION_KEY, session);
-}
+function loadSession() { return loadJSON(LS_SESSION_KEY, null); }
+function saveSession(session) { saveJSON(LS_SESSION_KEY, session); }
 function clearSession() {
-  try {
-    window.localStorage.removeItem(LS_SESSION_KEY);
-  } catch {
-    // ignore
-  }
+  try { window.localStorage.removeItem(LS_SESSION_KEY); } catch {}
 }
 
 function genPatientId() {
-  return 100000 + Math.floor(Math.random() * 900000); // 6 цифр
+  return 100000 + Math.floor(Math.random() * 900000);
 }
 
-// Glucose/GlucosePredicted у бэкенда — строки (sqlc мапит NUMERIC/DECIMAL из
-// Postgres в string), поэтому всегда парсим через parseFloat.
 function toNum(v) {
   const n = typeof v === "string" ? parseFloat(v) : v;
   return Number.isFinite(n) ? n : null;
 }
 
 async function apiFetch(path, options) {
-  const res = await fetch(`${API_BASE}${path}`, options);
-  if (!res.ok) throw new Error(`network: ${res.status}`);
-  return res.json();
+  const defaultHeaders = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+  };
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: { ...defaultHeaders, ...(options?.headers || {}) },
+  });
+  if (!res.ok) {
+    console.error(`API Error ${res.status} for ${path}`);
+    throw new Error(`API error: ${res.status}`);
+  }
+  const contentType = res.headers.get("content-type");
+  if (contentType && contentType.includes("application/json")) {
+    return res.json();
+  }
+  return {};
 }
 
-// ---- Больницы ----
-async function fetchAllHospitals() {
-  return apiFetch("/hospitals");
-}
+async function fetchAllHospitals() { return apiFetch("/hospitals"); }
 async function createHospital(name) {
   return apiFetch("/hospitals", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
 }
@@ -109,32 +104,22 @@ function fromNullUUID(value) {
   return null;
 }
 
-// ---- Админы ----
 async function createAdminUser(hospitalId) {
   return apiFetch("/admin", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ hospital_id: toNullUUID(hospitalId) }),
   });
 }
-async function fetchAdmin(adminId) {
-  return apiFetch(`/admin/${adminId}`);
-}
-async function fetchPatientsForAdmin(adminId) {
-  return apiFetch(`/admin/user/${adminId}`);
-}
+async function fetchAdmin(adminId) { return apiFetch(`/admin/${adminId}`); }
+async function fetchPatientsForAdmin(adminId) { return apiFetch(`/admin/user/${adminId}`); }
 
-// ---- Пациенты ----
 async function createPatientUser(id, name, hospitalId) {
   return apiFetch("/user", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, name, hospital_id: toNullUUID(hospitalId) }),
+    body: JSON.stringify({ id: parseInt(id, 10), name, hospital_id: toNullUUID(hospitalId) }),
   });
 }
-async function fetchPatientUser(patientId) {
-  return apiFetch(`/user/${patientId}`);
-}
+async function fetchPatientUser(patientId) { return apiFetch(`/user/${patientId}`); }
 
 async function resolveHospitalName(hospitalIdRaw) {
   const hospitalId = fromNullUUID(hospitalIdRaw);
@@ -147,8 +132,28 @@ async function resolveHospitalName(hospitalIdRaw) {
 async function fetchPatientSnapshot(patientId, period) {
   return apiFetch(`/glucose_levels/${patientId}?time_period=${encodeURIComponent(period)}`);
 }
+
 async function fetchRecommendations(patientId) {
-  return apiFetch(`/recommendations/${patientId}`);
+  const res = await fetch(`${API_BASE}/recommendations/${patientId}`, {
+    headers: { "Accept": "application/json" },
+  });
+  
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  
+  const data = await res.json();
+  
+  // Если бэкенд вернул ошибку вместо рекомендаций
+  if (data && data.Action && data.Action.String === "ERROR") {
+    console.warn("Backend returned error for recommendations:", data.Message?.String);
+    throw new Error("Backend error: " + (data.Message?.String || "unknown"));
+  }
+  
+  // Если бэкенд вернул одну запись вместо массива — извлекаем текст
+  if (data && data.Message && data.Message.String && data.Action?.String !== "ERROR") {
+    return { general: data.Message.String };
+  }
+  
+  return data;
 }
 
 function buildHistory(readings) {
@@ -182,56 +187,33 @@ function latestReadingFrom(history) {
   if (history.length === 0) return null;
   const last = history[history.length - 1];
   if (last.actual == null) return null;
-  return {
-    value: last.actual,
-    measuredAt: last.time,
-    status: classify(last.actual),
-  };
+  return { value: last.actual, measuredAt: last.time, status: classify(last.actual) };
 }
 
 function latestForecastFrom(predictions) {
   if (!predictions || predictions.length === 0) return null;
-
   const now = Date.now();
-  const targetTime = now + 30 * 60 * 1000; // Цель: ровно через 30 минут
-
-  // Ищем предсказание, которое ближе всего к целевому времени (+30 мин)
+  const targetTime = now + 30 * 60 * 1000;
   let closest = null;
   let minDiff = Infinity;
-
   for (const p of predictions) {
     const predTime = new Date(p.TimePredicted).getTime();
-    // Нас интересуют только будущие предсказания
     if (predTime > now) {
       const diff = Math.abs(predTime - targetTime);
-      if (diff < minDiff) {
-        minDiff = diff;
-        closest = p;
-      }
+      if (diff < minDiff) { minDiff = diff; closest = p; }
     }
   }
-
-  // Если не нашли ничего в будущем — берем самое последнее доступное как фолбэк
   if (!closest) {
     const sorted = [...predictions].sort(
       (a, b) => new Date(b.TimePredicted) - new Date(a.TimePredicted)
     );
     closest = sorted[0];
   }
-
   if (!closest) return null;
-
   const value = toNum(closest.GlucosePredicted);
   if (value == null) return null;
-
-  // Показываем время именно целевой точки (+30 мин), 
-  // даже если реальное предсказание было на 28 или 32 минуты
   const displayTime = new Date(targetTime);
-
-  return {
-    value,
-    forecastFor: displayTime.toISOString(),
-  };
+  return { value, forecastFor: displayTime.toISOString() };
 }
 
 function computeStats(historyRows) {
@@ -240,9 +222,7 @@ function computeStats(historyRows) {
   const avg = values.reduce((a, b) => a + b, 0) / values.length;
   const min = Math.min(...values);
   const max = Math.max(...values);
-  const inRange =
-    values.filter((v) => v >= TARGET_RANGE.low && v <= TARGET_RANGE.high).length /
-    values.length;
+  const inRange = values.filter((v) => v >= TARGET_RANGE.low && v <= TARGET_RANGE.high).length / values.length;
   return {
     average: Number(avg.toFixed(1)),
     min: Number(min.toFixed(1)),
@@ -251,7 +231,6 @@ function computeStats(historyRows) {
   };
 }
 
-// --- База продуктов (локально) ---
 const FOOD_DATABASE = [
   { name: "Овсянка на воде", calories: 88, protein: 3, fat: 1.7, carbs: 15 },
   { name: "Гречка варёная", calories: 110, protein: 4, fat: 1.1, carbs: 21 },
@@ -294,56 +273,27 @@ function computeMacros(food, grams) {
 async function fetchNutritionLog(patientId) {
   await delay(200);
   return [
-    {
-      id: "n1",
-      time: "08:22",
-      food: "Овсянка на воде",
-      grams: 250,
-      ...computeMacros(FOOD_DATABASE[0], 250),
-    },
-    {
-      id: "n2",
-      time: "13:10",
-      food: "Гречка варёная",
-      grams: 200,
-      ...computeMacros(FOOD_DATABASE[1], 200),
-    },
-    {
-      id: "n3",
-      time: "19:45",
-      food: "Лосось запечённый",
-      grams: 150,
-      ...computeMacros(FOOD_DATABASE[4], 150),
-    },
+    { id: "n1", time: "08:22", food: "Овсянка на воде", grams: 250, ...computeMacros(FOOD_DATABASE[0], 250) },
+    { id: "n2", time: "13:10", food: "Гречка варёная", grams: 200, ...computeMacros(FOOD_DATABASE[1], 200) },
+    { id: "n3", time: "19:45", food: "Лосось запечённый", grams: 150, ...computeMacros(FOOD_DATABASE[4], 150) },
   ];
 }
 
 async function fetchWhatIfForecast(patientId, params, baseHistory) {
   await delay(350);
   if (baseHistory.length === 0) return { points: [], netEffect: 0 };
-
-  const rnd = seedRandom(
-    Math.round(params.carbsG * 3 + params.proteinG * 5 + params.activityMin + 1)
-  );
+  const rnd = seedRandom(Math.round(params.carbsG * 3 + params.proteinG * 5 + params.activityMin + 1));
   const carbEffect = params.carbsG * 0.06;
   const proteinEffect = params.proteinG * 0.025;
   const activityEffect = -params.activityMin * 0.05;
   const netEffect = carbEffect + proteinEffect + activityEffect;
-
   const last = baseHistory[baseHistory.length - 1];
-  const stepMs =
-    baseHistory.length >= 2
-      ? last.t - baseHistory[baseHistory.length - 2].t
-      : 30 * 60000;
-
+  const stepMs = baseHistory.length >= 2 ? last.t - baseHistory[baseHistory.length - 2].t : 30 * 60000;
   const horizon = 8;
   const stepWeights = [0.4, 0.7, 0.85, 0.93, 0.97, 0.99, 1, 1];
   const points = [{ t: last.t, whatIf: last.actual }];
   for (let i = 0; i < horizon; i++) {
-    const value = Math.max(
-      3,
-      last.actual + netEffect * stepWeights[i] + (rnd() - 0.5) * 0.2
-    );
+    const value = Math.max(3, last.actual + netEffect * stepWeights[i] + (rnd() - 0.5) * 0.2);
     points.push({ t: last.t + (i + 1) * stepMs, whatIf: Number(value.toFixed(2)) });
   }
   return { points, netEffect: Number(netEffect.toFixed(2)) };
@@ -351,10 +301,7 @@ async function fetchWhatIfForecast(patientId, params, baseHistory) {
 
 function seedRandom(seed) {
   let s = seed;
-  return () => {
-    s = (s * 9301 + 49297) % 233280;
-    return s / 233280;
-  };
+  return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
 }
 
 function classify(value) {
@@ -366,50 +313,27 @@ function classify(value) {
 function getGlucoseTips(value, status) {
   if (status === "hypo") {
     if (value < 3.0) {
-      return {
-        severity: "critical",
-        title: "Очень низкий уровень глюкозы",
-        text:
-          "Съешьте 15–20 г быстрых углеводов (сок, глюкозные таблетки, мёд). Проверьте уровень через 15 минут. Если улучшения нет — обратитесь за помощью.",
-      };
+      return { severity: "critical", title: "Очень низкий уровень глюкозы", text: "Съешьте 15–20 г быстрых углеводов (сок, глюкозные таблетки, мёд). Проверьте уровень через 15 минут. Если улучшения нет — обратитесь за помощью." };
     }
-    return {
-      severity: "warning",
-      title: "Низкий уровень глюкозы",
-      text:
-        "Рассмотрите приём быстрых углеводов: сок, мёд, сладкий напиток (~15 г). Перепроверьте показатель через 15 минут («правило 15/15»).",
-    };
+    return { severity: "warning", title: "Низкий уровень глюкозы", text: "Рассмотрите приём быстрых углеводов: сок, мёд, сладкий напиток (~15 г). Перепроверьте показатель через 15 минут («правило 15/15»)." };
   }
   if (status === "hyper") {
     if (value > 13.9) {
-      return {
-        severity: "critical",
-        title: "Очень высокий уровень глюкозы",
-        text:
-          "Пейте воду небольшими порциями, избегайте дополнительных быстрых углеводов. При плохом самочувствии или наличии кетонов — свяжитесь с врачом.",
-      };
+      return { severity: "critical", title: "Очень высокий уровень глюкозы", text: "Пейте воду небольшими порциями, избегайте дополнительных быстрых углеводов. При плохом самочувствии или наличии кетонов — свяжитесь с врачом." };
     }
-    return {
-      severity: "warning",
-      title: "Повышенный уровень глюкозы",
-      text:
-        "Ограничьте быстрые углеводы в ближайший приём пищи, добавьте лёгкую физическую активность, если это разрешено вашим планом лечения.",
-    };
+    return { severity: "warning", title: "Повышенный уровень глюкозы", text: "Ограничьте быстрые углеводы в ближайший приём пищи, добавьте лёгкую физическую активность, если это разрешено вашим планом лечения." };
   }
   return null;
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 async function withRetry(fn, { retries = 3 } = {}) {
   let attempt = 0;
   let lastErr;
   while (attempt <= retries) {
-    try {
-      return await fn();
-    } catch (err) {
+    try { return await fn(); }
+    catch (err) {
       lastErr = err;
       attempt += 1;
       if (attempt > retries) break;
@@ -418,10 +342,6 @@ async function withRetry(fn, { retries = 3 } = {}) {
   }
   throw lastErr;
 }
-
-// ============================================================================
-// UI-константы
-// ============================================================================
 
 const STATUS_META = {
   normal: { label: "Норма", color: "#0F6E56", bg: "#E1F5EE" },
@@ -439,14 +359,7 @@ function formatTime(iso, rangeKey) {
 
 function toCsv(rows) {
   const header = "time,actual_mmol_l,forecast_nn_mmol_l,forecast_ode_mmol_l\n";
-  const body = rows
-    .map(
-      (d) =>
-        `${new Date(d.t).toISOString()},${d.actual ?? ""},${d.forecastNN ?? ""},${
-          d.forecastODE ?? ""
-        }`
-    )
-    .join("\n");
+  const body = rows.map((d) => `${new Date(d.t).toISOString()},${d.actual ?? ""},${d.forecastNN ?? ""},${d.forecastODE ?? ""}`).join("\n");
   return header + body;
 }
 
@@ -462,7 +375,6 @@ function downloadCsv(history, patientName) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-
 // ============================================================================
 // Компонент Dashboard
 // ============================================================================
@@ -485,19 +397,16 @@ function Dashboard({ session, onLogout }) {
       .catch(() => {
         if (!cancelled) setPatientsLoaded(true);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [session]);
 
-const [patientId, setPatientId] = useState(null);
+  const [patientId, setPatientId] = useState(null);
 
-  // Устанавливаем первого пациента только при загрузке списка
   useEffect(() => {
     if (patients.length > 0 && patientId === null) {
       setPatientId(patients[0].id);
     }
-  }, [patients]);  // ← убрали patientId из зависимостей
+  }, [patients]);
 
   const [rangeKey, setRangeKey] = useState("24h");
   const [connected, setConnected] = useState(true);
@@ -505,10 +414,10 @@ const [patientId, setPatientId] = useState(null);
   const [snapshot, setSnapshot] = useState(null);
   const [debugOverride, setDebugOverride] = useState("");
   const [nutritionLog, setNutritionLog] = useState([]);
+  const [recommendations, setRecommendations] = useState(null);
+  const [recommendationsError, setRecommendationsError] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
-
-  const [recommendations, setRecommendations] = useState(null);
 
   const [whatIf, setWhatIf] = useState({ carbsG: 0, proteinG: 0, activityMin: 0 });
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
@@ -519,14 +428,8 @@ const [patientId, setPatientId] = useState(null);
 
   const history = useMemo(() => buildHistory(snapshot?.readings), [snapshot]);
   const latest = useMemo(() => latestReadingFrom(history), [history]);
-  const forecastNN = useMemo(
-    () => latestForecastFrom(snapshot?.model_predictions),
-    [snapshot]
-  );
-  const forecastODE = useMemo(
-    () => latestForecastFrom(snapshot?.odu_predictions),
-    [snapshot]
-  );
+  const forecastNN = useMemo(() => latestForecastFrom(snapshot?.model_predictions), [snapshot]);
+  const forecastODE = useMemo(() => latestForecastFrom(snapshot?.odu_predictions), [snapshot]);
   const futureForecastRows = useMemo(
     () => buildFutureForecastRows(snapshot?.model_predictions, snapshot?.odu_predictions),
     [snapshot]
@@ -538,23 +441,16 @@ const [patientId, setPatientId] = useState(null);
     if (!patientId) return;
     let cancelled = false;
     fetchPatientSnapshot(patientId, "all")
-      .then((res) => {
-        if (!cancelled) setFullSnapshot(res);
-      })
+      .then((res) => { if (!cancelled) setFullSnapshot(res); })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [patientId]);
   const fullHistory = useMemo(() => buildHistory(fullSnapshot?.readings), [fullSnapshot]);
 
   const currentPeriod = RANGE_OPTIONS.find((r) => r.key === rangeKey)?.period || "24h";
 
   const loadAll = useCallback(async () => {
-    if (!patientId) {
-      setLoading(false);
-      return;
-    }
+    if (!patientId) { setLoading(false); return; }
     try {
       const [snapshotRes, nutritionRes] = await Promise.all([
         withRetry(() => fetchPatientSnapshot(patientId, currentPeriod)),
@@ -565,22 +461,22 @@ const [patientId, setPatientId] = useState(null);
       setConnected(true);
       setError(null);
     } catch (err) {
+      console.error("Main data load failed:", err);
       setConnected(false);
       setError("Не удалось получить данные с сервера.");
     }
 
-    // Загружаем рекомендации отдельно
-    try {
-      const recommendationsRes = await withRetry(() => fetchRecommendations(patientId));
-      setRecommendations(recommendationsRes);
-    } catch (err) {
-      // Демо-данные, если бэкенд пока не готов
-      setRecommendations({
-        nutrition: "Рекомендуется соблюдать режим питания. Ограничьте быстрые углеводы.",
-        activity: "Добавьте 30 минут лёгкой физической активности в день.",
-        general: "Продолжайте регулярный мониторинг глюкозы.",
-      });
-    }
+    // Загружаем рекомендации отдельно, чтобы ошибка 406 не ломала весь экран
+// Загружаем рекомендации отдельно
+try {
+  const recs = await withRetry(() => fetchRecommendations(patientId));
+  setRecommendations(recs);
+  setRecommendationsError(null);
+} catch (err) {
+  console.warn("Recommendations load failed:", err);
+  setRecommendations(null);
+  setRecommendationsError(err.message);
+}
 
     setLoading(false);
   }, [patientId, currentPeriod]);
@@ -611,11 +507,7 @@ const [patientId, setPatientId] = useState(null);
       try {
         const res = await withRetry(() => fetchWhatIfForecast(patientId, params, history));
         setWhatIfData(res);
-      } catch {
-        // ignore
-      } finally {
-        setWhatIfLoading(false);
-      }
+      } catch {} finally { setWhatIfLoading(false); }
     },
     [patientId, history]
   );
@@ -623,56 +515,35 @@ const [patientId, setPatientId] = useState(null);
   useEffect(() => {
     const t = setTimeout(() => runWhatIf(whatIf), 250);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [whatIf, history]);
+  }, [whatIf, history, runWhatIf]);
 
   const chartData = useMemo(() => {
     const historyRows = history.map((d) => ({
-      t: d.t,
-      label: formatTime(d.time, rangeKey),
-      actual: d.actual,
-      forecastNN: null,
-      forecastODE: null,
-      whatIf: null,
+      t: d.t, label: formatTime(d.time, rangeKey), actual: d.actual,
+      forecastNN: null, forecastODE: null, whatIf: null,
     }));
-
     const forecastRows = futureForecastRows.map((d) => ({
-      t: d.t,
-      label: formatTime(new Date(d.t).toISOString(), rangeKey),
-      actual: null,
-      forecastNN: d.forecastNN ?? null,
-      forecastODE: d.forecastODE ?? null,
-      whatIf: null,
+      t: d.t, label: formatTime(new Date(d.t).toISOString(), rangeKey), actual: null,
+      forecastNN: d.forecastNN ?? null, forecastODE: d.forecastODE ?? null, whatIf: null,
     }));
-
     let rows = [...historyRows, ...forecastRows].sort((a, b) => a.t - b.t);
 
-    // Сценарий "что если"
     const whatIfPoints = whatIfData.points;
     if (historyRows.length > 0 && whatIfPoints.length > 0) {
       const [anchor, ...future] = whatIfPoints;
       const anchorIdx = rows.findIndex((r) => r.t === anchor.t);
-      if (anchorIdx !== -1) {
-        rows[anchorIdx] = { ...rows[anchorIdx], whatIf: anchor.whatIf };
-      }
+      if (anchorIdx !== -1) rows[anchorIdx] = { ...rows[anchorIdx], whatIf: anchor.whatIf };
       const whatIfFutureRows = future.map((d) => ({
-        t: d.t,
-        label: formatTime(new Date(d.t).toISOString(), rangeKey),
-        actual: null,
-        forecastNN: null,
-        forecastODE: null,
-        whatIf: d.whatIf,
+        t: d.t, label: formatTime(new Date(d.t).toISOString(), rangeKey), actual: null,
+        forecastNN: null, forecastODE: null, whatIf: d.whatIf,
       }));
       rows = [...rows, ...whatIfFutureRows].sort((a, b) => a.t - b.t);
     }
-
     return rows;
   }, [history, futureForecastRows, whatIfData, rangeKey]);
 
   const yDomain = useMemo(() => {
-    const values = chartData.flatMap((d) =>
-      [d.actual, d.forecastNN, d.forecastODE, d.whatIf].filter((v) => v != null)
-    );
+    const values = chartData.flatMap((d) => [d.actual, d.forecastNN, d.forecastODE, d.whatIf].filter((v) => v != null));
     if (values.length === 0) return [3, 12];
     return [Math.floor(Math.min(...values, 3)) - 0.5, Math.ceil(Math.max(...values, 11)) + 0.5];
   }, [chartData]);
@@ -687,37 +558,22 @@ const [patientId, setPatientId] = useState(null);
   return (
     <div style={styles.page}>
       <div style={styles.card}>
-        <Header
-          patient={patient}
-          patients={patients}
-          onPatientChange={setPatientId}
-          connected={connected}
-          session={session}
-          onLogout={onLogout}
-        />
+        <Header patient={patient} patients={patients} onPatientChange={setPatientId} connected={connected} session={session} onLogout={onLogout} />
 
         {!patientsLoaded ? (
           <div style={styles.emptyState}>Загружаем список пациентов…</div>
         ) : !patient ? (
-          <div style={styles.emptyState}>
-            В больнице «{session.hospitalName}» пока нет ни одного
-            зарегистрированного пациента. Как только кто-то зарегистрируется с
-            ролью «Пациент» и укажет эту же больницу, он появится в списке
-            здесь.
-          </div>
+          <div style={styles.emptyState}>В больнице «{session.hospitalName}» пока нет ни одного зарегистрированного пациента.</div>
         ) : (
           <>
             {error && (
               <div style={styles.errorBanner}>
                 <span>{error}</span>
-                <button style={styles.retryBtn} onClick={loadAll}>
-                  Повторить
-                </button>
+                <button style={styles.retryBtn} onClick={loadAll}>Повторить</button>
               </div>
             )}
 
             <DebugPanel value={debugOverride} onChange={setDebugOverride} />
-
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
@@ -725,36 +581,27 @@ const [patientId, setPatientId] = useState(null);
               <ForecastCard model={MODELS.ode} forecast={forecastODE} loading={loading} />
             </div>
 
-            {/* ✅ ПАНЕЛЬ РЕКОМЕНДАЦИЙ */}
-            <RecommendationsPanel recommendations={recommendations} loading={loading} />
+            {/* РЕКОМЕНДАЦИИ */}
+            <RecommendationsPanel 
+            recommendations={recommendations} 
+            loading={loading} 
+            error={recommendationsError} 
+/>
 
             {!loading && displayedLatest && <TipsBanner latest={displayedLatest} />}
 
             <RangeSelector rangeKey={rangeKey} onChange={setRangeKey} />
 
             <ChartBlock
-              data={chartData}
-              yDomain={yDomain}
-              rangeKey={rangeKey}
-              loading={loading}
+              data={chartData} yDomain={yDomain} rangeKey={rangeKey} loading={loading}
               onExport={() => downloadCsv(chartData, patient.name)}
-              nowLabel={
-                history.length ? formatTime(history[history.length - 1].time, rangeKey) : null
-              }
+              nowLabel={history.length ? formatTime(history[history.length - 1].time, rangeKey) : null}
             />
 
-            <WhatIfSimulator
-              whatIf={whatIf}
-              onChange={setWhatIf}
-              loading={whatIfLoading}
-              netEffect={whatIfData.netEffect}
-            />
+            <WhatIfSimulator whatIf={whatIf} onChange={setWhatIf} loading={whatIfLoading} netEffect={whatIfData.netEffect} />
 
             <div style={styles.bottomRow}>
-              <NutritionLog
-                entries={nutritionLog}
-                onAdd={(entry) => setNutritionLog((prev) => [...prev, entry])}
-              />
+              <NutritionLog entries={nutritionLog} onAdd={(entry) => setNutritionLog((prev) => [...prev, entry])} />
               <Statistics stats={stats} loading={loading} />
             </div>
 
@@ -764,7 +611,6 @@ const [patientId, setPatientId] = useState(null);
             />
           </>
         )}
-
         <Footer />
       </div>
     </div>
@@ -784,9 +630,7 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
       </div>
       <div style={styles.headerRight}>
         <div style={styles.sessionInfo}>
-          <span style={styles.roleBadge}>
-            {session.role === "admin" ? "Администратор" : "Пациент"}
-          </span>
+          <span style={styles.roleBadge}>{session.role === "admin" ? "Администратор" : "Пациент"}</span>
           <span style={styles.smallMuted}>{session.hospitalName}</span>
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
@@ -797,16 +641,8 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
             {patients.length === 0 ? (
               <span style={styles.smallMuted}> нет пациентов</span>
             ) : (
-              <select
-                value={patient?.id ?? ""}
-                onChange={(e) => onPatientChange(e.target.value)}
-                style={styles.select}
-              >
-                {patients.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
+              <select value={String(patient?.id ?? "")} onChange={(e) => onPatientChange(e.target.value)} style={styles.select}>
+                {patients.map((p) => (<option key={p.id} value={p.id}>{p.name}</option>))}
               </select>
             )}
           </label>
@@ -815,18 +651,10 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
         )}
 
         <div style={styles.connectionIndicator}>
-          <span
-            style={{
-              ...styles.connectionDot,
-              background: connected ? "#0F6E56" : "#993C1D",
-            }}
-          />
+          <span style={{ ...styles.connectionDot, background: connected ? "#0F6E56" : "#993C1D" }} />
           {connected ? "Подключено" : "Нет соединения"}
         </div>
-
-        <button style={styles.logoutBtn} onClick={onLogout}>
-          Выйти
-        </button>
+        <button style={styles.logoutBtn} onClick={onLogout}>Выйти</button>
       </div>
     </div>
   );
@@ -836,22 +664,9 @@ function DebugPanel({ value, onChange }) {
   return (
     <div style={styles.debugPanel}>
       <span style={styles.debugLabel}>Тест: подставить уровень глюкозы</span>
-      <input
-        type="number"
-        step="0.1"
-        placeholder="напр. 3.2 или 11.5"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        style={styles.debugInput}
-      />
-      <span style={styles.debugHint}>
-        {"< 3.9 — гипо, > 10.0 — гипер, между — норма"}
-      </span>
-      {value !== "" && (
-        <button style={styles.debugReset} onClick={() => onChange("")}>
-          Сбросить
-        </button>
-      )}
+      <input type="number" step="0.1" placeholder="напр. 3.2 или 11.5" value={value} onChange={(e) => onChange(e.target.value)} style={styles.debugInput} />
+      <span style={styles.debugHint}>{"< 3.9 — гипо, > 10.0 — гипер, между — норма"}</span>
+      {value !== "" && <button style={styles.debugReset} onClick={() => onChange("")}>Сбросить</button>}
     </div>
   );
 }
@@ -861,28 +676,13 @@ function GlucoseCard({ latest, loading }) {
   return (
     <div style={styles.statCard}>
       <div style={styles.statCardLabel}>Текущая глюкоза</div>
-      {loading || !latest ? (
-        <div style={styles.skeleton} />
-      ) : (
+      {loading || !latest ? (<div style={styles.skeleton} />) : (
         <>
           <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
             <span style={styles.bigValue}>{latest.value} ммоль/л</span>
-            <span
-              style={{
-                ...styles.badge,
-                color: meta.color,
-                background: meta.bg,
-              }}
-            >
-              {meta.label}
-            </span>
+            <span style={{ ...styles.badge, color: meta.color, background: meta.bg }}>{meta.label}</span>
           </div>
-          <div style={styles.smallMuted}>
-            {new Date(latest.measuredAt).toLocaleTimeString("ru-RU", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })}
-          </div>
+          <div style={styles.smallMuted}>{new Date(latest.measuredAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</div>
         </>
       )}
     </div>
@@ -894,34 +694,17 @@ function ForecastCard({ model, forecast, loading, modelStatus }) {
     <div style={styles.statCard}>
       <div style={styles.statCardLabel}>
         Прогноз
-        <span style={{ ...styles.modelTag, color: model.color }}>
-          {" "}· {model.label}
-        </span>
+        <span style={{ ...styles.modelTag, color: model.color }}> · {model.label}</span>
       </div>
-      {loading ? (
-        <div style={styles.skeleton} />
-      ) : !forecast && modelStatus === 'training' ? (
+      {loading ? (<div style={styles.skeleton} />) : !forecast && modelStatus === 'training' ? (
         <>
           <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Ожидаю обучение</span>
           <div style={styles.smallMuted}>Модель ещё не готова к прогнозам</div>
         </>
-      ) : !forecast && modelStatus === 'not_ready' ? (
-        <>
-          <span style={{ ...styles.bigValue, fontSize: 16, color: "#898781" }}>Не готов</span>
-          <div style={styles.smallMuted}>Нет данных для прогноза</div>
-        </>
-      ) : !forecast ? (
-        <div style={styles.skeleton} />
-      ) : (
+      ) : !forecast ? (<div style={styles.skeleton} />) : (
         <>
           <span style={styles.bigValue}>{forecast.value} ммоль/л</span>
-          <div style={styles.smallMuted}>
-            на{" "}
-            {new Date(forecast.forecastFor).toLocaleTimeString("ru-RU", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })}
-          </div>
+          <div style={styles.smallMuted}>на {new Date(forecast.forecastFor).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</div>
         </>
       )}
     </div>
@@ -931,25 +714,12 @@ function ForecastCard({ model, forecast, loading, modelStatus }) {
 function TipsBanner({ latest }) {
   const tip = getGlucoseTips(latest.value, latest.status);
   if (!tip) return null;
-
-  const palette =
-    tip.severity === "critical"
-      ? { color: "#712B13", bg: "#FAECE7", border: "#E5A188" }
-      : { color: "#8A5A12", bg: "#FBF2E1", border: "#E6C27A" };
-
+  const palette = tip.severity === "critical" ? { color: "#712B13", bg: "#FAECE7", border: "#E5A188" } : { color: "#8A5A12", bg: "#FBF2E1", border: "#E6C27A" };
   return (
-    <div
-      style={{
-        ...styles.tipsBanner,
-        background: palette.bg,
-        borderColor: palette.border,
-      }}
-    >
+    <div style={{ ...styles.tipsBanner, background: palette.bg, borderColor: palette.border }}>
       <div style={{ ...styles.tipsTitle, color: palette.color }}>{tip.title}</div>
       <div style={{ ...styles.tipsText, color: palette.color }}>{tip.text}</div>
-      <div style={styles.tipsDisclaimer}>
-        Общая информация, не заменяет назначения врача.
-      </div>
+      <div style={styles.tipsDisclaimer}>Общая информация, не заменяет назначения врача.</div>
     </div>
   );
 }
@@ -958,16 +728,7 @@ function RangeSelector({ rangeKey, onChange }) {
   return (
     <div style={styles.rangeRow}>
       {RANGE_OPTIONS.map((opt) => (
-        <button
-          key={opt.key}
-          onClick={() => onChange(opt.key)}
-          style={{
-            ...styles.rangeBtn,
-            ...(rangeKey === opt.key ? styles.rangeBtnActive : {}),
-          }}
-        >
-          {opt.label}
-        </button>
+        <button key={opt.key} onClick={() => onChange(opt.key)} style={{ ...styles.rangeBtn, ...(rangeKey === opt.key ? styles.rangeBtnActive : {}) }}>{opt.label}</button>
       ))}
     </div>
   );
@@ -976,103 +737,24 @@ function RangeSelector({ rangeKey, onChange }) {
 function ChartBlock({ data, yDomain, rangeKey, loading, onExport, nowLabel }) {
   const lastLabel = data.length ? data[data.length - 1].label : null;
   const hasScenario = nowLabel && lastLabel && nowLabel !== lastLabel;
-
   return (
     <div style={styles.chartBlock}>
       <div style={styles.chartHeaderRow}>
         <Legend />
-        <button style={styles.exportBtn} onClick={onExport} disabled={loading}>
-          Экспорт в CSV
-        </button>
+        <button style={styles.exportBtn} onClick={onExport} disabled={loading}>Экспорт в CSV</button>
       </div>
       <div style={{ width: "100%", height: 260 }}>
         <ResponsiveContainer>
           <ComposedChart data={data} margin={{ top: 24, right: 10, left: -10, bottom: 0 }}>
             <CartesianGrid stroke="#e1e0d9" vertical={false} />
-            <XAxis
-              dataKey="label"
-              tick={{ fontSize: 11, fill: "#898781" }}
-              minTickGap={30}
-              axisLine={{ stroke: "#c3c2b7" }}
-              tickLine={false}
-            />
-            <YAxis
-              domain={yDomain}
-              tick={{ fontSize: 11, fill: "#898781" }}
-              axisLine={false}
-              tickLine={false}
-              width={36}
-            />
-            <ReferenceArea
-              y1={TARGET_RANGE.low}
-              y2={TARGET_RANGE.high}
-              fill="#5DCAA5"
-              fillOpacity={0.12}
-              ifOverflow="extendDomain"
-            />
-            {hasScenario && (
-              <ReferenceArea
-                x1={nowLabel}
-                x2={lastLabel}
-                fill="#F2A340"
-                fillOpacity={0.14}
-                ifOverflow="extendDomain"
-                label={{
-                  value: "Сценарий «что если»",
-                  position: "insideTop",
-                  fontSize: 11,
-                  fill: "#8A5A12",
-                }}
-              />
-            )}
-            {nowLabel && (
-              <ReferenceLine
-                x={nowLabel}
-                stroke="#898781"
-                strokeDasharray="3 3"
-                label={{ value: "Сейчас", position: "top", fontSize: 11, fill: "#52514e" }}
-              />
-            )}
-            <Tooltip
-              formatter={(value, name) => {
-                return [
-                  value == null ? "—" : `${value} ммоль/л`,
-                  {
-                    actual: "Факт",
-                    forecastNN: "Прогноз (нейросеть)",
-                    forecastODE: "Прогноз (ОДУ)",
-                    whatIf: "Что если",
-                  }[name] || name,
-                ];
-              }}
-              contentStyle={{ fontSize: 12, borderRadius: 8 }}
-            />
-            <Area
-              type="monotone"
-              dataKey="actual"
-              stroke="#185FA5"
-              strokeWidth={2}
-              fill="#85B7EB"
-              fillOpacity={0.25}
-              dot={false}
-              connectNulls
-              isAnimationActive={false}
-            />
-            <Line
-              type="monotone"
-              dataKey="whatIf"
-              stroke="#C2410C"
-              strokeWidth={3}
-              dot={{ r: 4, fill: "#C2410C", stroke: "#fff", strokeWidth: 1 }}
-              connectNulls
-              isAnimationActive={false}
-              label={{
-                position: "top",
-                fontSize: 11,
-                fill: "#C2410C",
-                formatter: (v) => (v == null ? "" : v.toFixed(1)),
-              }}
-            />
+            <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#898781" }} minTickGap={30} axisLine={{ stroke: "#c3c2b7" }} tickLine={false} />
+            <YAxis domain={yDomain} tick={{ fontSize: 11, fill: "#898781" }} axisLine={false} tickLine={false} width={36} />
+            <ReferenceArea y1={TARGET_RANGE.low} y2={TARGET_RANGE.high} fill="#5DCAA5" fillOpacity={0.12} ifOverflow="extendDomain" />
+            {hasScenario && (<ReferenceArea x1={nowLabel} x2={lastLabel} fill="#F2A340" fillOpacity={0.14} ifOverflow="extendDomain" label={{ value: "Сценарий «что если»", position: "insideTop", fontSize: 11, fill: "#8A5A12" }} />)}
+            {nowLabel && (<ReferenceLine x={nowLabel} stroke="#898781" strokeDasharray="3 3" label={{ value: "Сейчас", position: "top", fontSize: 11, fill: "#52514e" }} />)}
+            <Tooltip formatter={(value, name) => [value == null ? "—" : `${value} ммоль/л`, { actual: "Факт", whatIf: "Что если" }[name] || name]} contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+            <Area type="monotone" dataKey="actual" stroke="#185FA5" strokeWidth={2} fill="#85B7EB" fillOpacity={0.25} dot={false} connectNulls isAnimationActive={false} />
+            <Line type="monotone" dataKey="whatIf" stroke="#C2410C" strokeWidth={3} dot={{ r: 4, fill: "#C2410C", stroke: "#fff", strokeWidth: 1 }} connectNulls isAnimationActive={false} label={{ position: "top", fontSize: 11, fill: "#C2410C", formatter: (v) => (v == null ? "" : v.toFixed(1)) }} />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -1090,14 +772,7 @@ function Legend() {
     <div style={styles.legendRow}>
       {items.map((it) => (
         <span key={it.label} style={styles.legendItem}>
-          <span
-            style={{
-              ...styles.legendMark,
-              background: it.swatch ? it.color : "transparent",
-              borderTop: it.swatch ? "none" : `2px ${it.dash ? "dashed" : "solid"} ${it.color}`,
-              opacity: it.swatch ? 0.3 : 1,
-            }}
-          />
+          <span style={{ ...styles.legendMark, background: it.swatch ? it.color : "transparent", borderTop: it.swatch ? "none" : `2px ${it.dash ? "dashed" : "solid"} ${it.color}`, opacity: it.swatch ? 0.3 : 1 }} />
           {it.label}
         </span>
       ))}
@@ -1110,39 +785,12 @@ function WhatIfSimulator({ whatIf, onChange, loading, netEffect }) {
   const effectColor = netEffect > 0.05 ? "#993C1D" : netEffect < -0.05 ? "#0F6E56" : "#52514e";
   return (
     <div style={styles.whatIfBlock}>
-      <div style={styles.whatIfHeader}>
-        Симулятор «что если»
-        {loading && <span style={styles.smallMuted}> · пересчёт…</span>}
-      </div>
-      <div style={{ ...styles.effectReadout, color: effectColor }}>
-        Ожидаемый эффект: {netEffect > 0 ? "+" : ""}
-        {netEffect.toFixed(1)} ммоль/л к концу сценария
-      </div>
+      <div style={styles.whatIfHeader}>Симулятор «что если»{loading && <span style={styles.smallMuted}> · пересчёт…</span>}</div>
+      <div style={{ ...styles.effectReadout, color: effectColor }}>Ожидаемый эффект: {netEffect > 0 ? "+" : ""}{netEffect.toFixed(1)} ммоль/л к концу сценария</div>
       <div style={styles.slidersRow}>
-        <SliderField
-          label="Углеводы"
-          unit="г"
-          min={-30}
-          max={60}
-          value={whatIf.carbsG}
-          onChange={set("carbsG")}
-        />
-        <SliderField
-          label="Белки"
-          unit="г"
-          min={-20}
-          max={40}
-          value={whatIf.proteinG}
-          onChange={set("proteinG")}
-        />
-        <SliderField
-          label="Активность"
-          unit="мин"
-          min={0}
-          max={60}
-          value={whatIf.activityMin}
-          onChange={set("activityMin")}
-        />
+        <SliderField label="Углеводы" unit="г" min={-30} max={60} value={whatIf.carbsG} onChange={set("carbsG")} />
+        <SliderField label="Белки" unit="г" min={-20} max={40} value={whatIf.proteinG} onChange={set("proteinG")} />
+        <SliderField label="Активность" unit="мин" min={0} max={60} value={whatIf.activityMin} onChange={set("activityMin")} />
       </div>
     </div>
   );
@@ -1151,22 +799,8 @@ function WhatIfSimulator({ whatIf, onChange, loading, netEffect }) {
 function SliderField({ label, unit, min, max, value, onChange }) {
   return (
     <div style={styles.sliderField}>
-      <div style={styles.sliderLabelRow}>
-        <span>{label}</span>
-        <span style={styles.sliderValue}>
-          {value > 0 ? "+" : ""}
-          {value} {unit}
-        </span>
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={1}
-        value={value}
-        onChange={onChange}
-        style={{ width: "100%" }}
-      />
+      <div style={styles.sliderLabelRow}><span>{label}</span><span style={styles.sliderValue}>{value > 0 ? "+" : ""}{value} {unit}</span></div>
+      <input type="range" min={min} max={max} step={1} value={value} onChange={onChange} style={{ width: "100%" }} />
     </div>
   );
 }
@@ -1175,38 +809,12 @@ function NutritionLog({ entries, onAdd }) {
   return (
     <div style={styles.panel}>
       <div style={styles.panelTitle}>Журнал питания</div>
-
       <NutritionEntryForm onAdd={onAdd} />
-
       <table style={styles.table}>
-        <thead>
-          <tr>
-            <th style={styles.th}>Время</th>
-            <th style={styles.th}>Продукт</th>
-            <th style={styles.th}>Граммы</th>
-            <th style={styles.th}>Ккал</th>
-            <th style={styles.th}>Б/Ж/У</th>
-          </tr>
-        </thead>
+        <thead><tr><th style={styles.th}>Время</th><th style={styles.th}>Продукт</th><th style={styles.th}>Граммы</th><th style={styles.th}>Ккал</th><th style={styles.th}>Б/Ж/У</th></tr></thead>
         <tbody>
-          {entries.map((e) => (
-            <tr key={e.id}>
-              <td style={styles.td}>{e.time}</td>
-              <td style={styles.td}>{e.food}</td>
-              <td style={styles.td}>{e.grams} г</td>
-              <td style={styles.td}>{e.calories}</td>
-              <td style={styles.td}>
-                {e.protein}/{e.fat}/{e.carbs}
-              </td>
-            </tr>
-          ))}
-          {entries.length === 0 && (
-            <tr>
-              <td style={styles.td} colSpan={5}>
-                Записей пока нет — добавьте первый приём пищи выше.
-              </td>
-            </tr>
-          )}
+          {entries.map((e) => (<tr key={e.id}><td style={styles.td}>{e.time}</td><td style={styles.td}>{e.food}</td><td style={styles.td}>{e.grams} г</td><td style={styles.td}>{e.calories}</td><td style={styles.td}>{e.protein}/{e.fat}/{e.carbs}</td></tr>))}
+          {entries.length === 0 && (<tr><td style={styles.td} colSpan={5}>Записей пока нет — добавьте первый приём пищи выше.</td></tr>)}
         </tbody>
       </table>
     </div>
@@ -1217,80 +825,28 @@ function NutritionEntryForm({ onAdd }) {
   const [query, setQuery] = useState("");
   const [selectedFood, setSelectedFood] = useState(null);
   const [grams, setGrams] = useState(150);
-
   const matches = useMemo(() => findFoodMatches(query), [query]);
   const preview = selectedFood ? computeMacros(selectedFood, grams) : null;
-
-  const handlePick = (food) => {
-    setSelectedFood(food);
-    setQuery(food.name);
-  };
-
+  const handlePick = (food) => { setSelectedFood(food); setQuery(food.name); };
   const handleAdd = () => {
     if (!selectedFood || !grams || grams <= 0) return;
     const macros = computeMacros(selectedFood, grams);
-    onAdd({
-      id: `n-${Date.now()}`,
-      time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
-      food: selectedFood.name,
-      grams,
-      ...macros,
-    });
-    setQuery("");
-    setSelectedFood(null);
-    setGrams(150);
+    onAdd({ id: `n-${Date.now()}`, time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }), food: selectedFood.name, grams, ...macros });
+    setQuery(""); setSelectedFood(null); setGrams(150);
   };
-
   return (
     <div style={styles.nutritionForm}>
       <div style={styles.nutritionFormRow}>
         <div style={{ position: "relative", flex: 2 }}>
-          <input
-            type="text"
-            placeholder="Название продукта (напр. Гречка)"
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setSelectedFood(null);
-            }}
-            style={styles.nutritionInput}
-          />
-          {query && !selectedFood && matches.length > 0 && (
-            <div style={styles.suggestList}>
-              {matches.map((f) => (
-                <div key={f.name} style={styles.suggestItem} onClick={() => handlePick(f)}>
-                  {f.name}
-                  <span style={styles.smallMuted}> · {f.calories} ккал/100г</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {query && !selectedFood && matches.length === 0 && query.trim().length >= 2 && (
-            <div style={styles.suggestEmpty}>Не найдено в базе продуктов</div>
-          )}
+          <input type="text" placeholder="Название продукта (напр. Гречка)" value={query} onChange={(e) => { setQuery(e.target.value); setSelectedFood(null); }} style={styles.nutritionInput} />
+          {query && !selectedFood && matches.length > 0 && (<div style={styles.suggestList}>{matches.map((f) => (<div key={f.name} style={styles.suggestItem} onClick={() => handlePick(f)}>{f.name}<span style={styles.smallMuted}> · {f.calories} ккал/100г</span></div>))}</div>)}
+          {query && !selectedFood && matches.length === 0 && query.trim().length >= 2 && (<div style={styles.suggestEmpty}>Не найдено в базе продуктов</div>)}
         </div>
-        <input
-          type="number"
-          min={1}
-          value={grams}
-          onChange={(e) => setGrams(Number(e.target.value))}
-          style={styles.nutritionGramsInput}
-        />
+        <input type="number" min={1} value={grams} onChange={(e) => setGrams(Number(e.target.value))} style={styles.nutritionGramsInput} />
         <span style={styles.smallMuted}>г</span>
-        <button
-          style={styles.nutritionAddBtn}
-          onClick={handleAdd}
-          disabled={!selectedFood}
-        >
-          Добавить
-        </button>
+        <button style={styles.nutritionAddBtn} onClick={handleAdd} disabled={!selectedFood}>Добавить</button>
       </div>
-      {preview && (
-        <div style={styles.nutritionPreview}>
-          {preview.calories} ккал · Б {preview.protein} г · Ж {preview.fat} г · У{" "}
-          {preview.carbs} г
-        </div>
-      )}
+      {preview && (<div style={styles.nutritionPreview}>{preview.calories} ккал · Б {preview.protein} г · Ж {preview.fat} г · У {preview.carbs} г</div>)}
     </div>
   );
 }
@@ -1299,9 +855,7 @@ function Statistics({ stats, loading }) {
   return (
     <div style={styles.panel}>
       <div style={styles.panelTitle}>Статистика</div>
-      {loading || !stats ? (
-        <div style={styles.skeleton} />
-      ) : (
+      {loading || !stats ? (<div style={styles.skeleton} />) : (
         <div style={styles.statsGrid}>
           <StatRow label="Среднее" value={`${stats.average} ммоль/л`} />
           <StatRow label="Мин" value={`${stats.min} ммоль/л`} />
@@ -1312,7 +866,8 @@ function Statistics({ stats, loading }) {
     </div>
   );
 }
-function RecommendationsPanel({ recommendations, loading }) {
+
+function RecommendationsPanel({ recommendations, loading, error }) {
   if (loading) {
     return (
       <div style={styles.panel}>
@@ -1321,6 +876,18 @@ function RecommendationsPanel({ recommendations, loading }) {
       </div>
     );
   }
+  
+  if (error) {
+    return (
+      <div style={{ ...styles.panel, background: "#FBF2E1", borderColor: "#E6C27A" }}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={{ fontSize: 13, color: "#8A5A12" }}>
+          ⚠️ Рекомендации временно недоступны. Бэкенд ещё обрабатывает данные пациента.
+        </div>
+      </div>
+    );
+  }
+  
   if (!recommendations) {
     return (
       <div style={styles.panel}>
@@ -1329,10 +896,18 @@ function RecommendationsPanel({ recommendations, loading }) {
       </div>
     );
   }
-  const items = Array.isArray(recommendations)
-    ? recommendations
+  
+  const items = Array.isArray(recommendations) 
+    ? recommendations 
     : Object.entries(recommendations).map(([key, value]) => ({ type: key, text: value }));
-  const typeLabels = { nutrition: "🍎 Питание", activity: "🏃 Активность", insulin: "💉 Инсулин", general: "📋 Общие", monitoring: "📊 Мониторинг" };
+  
+  const typeLabels = { 
+    nutrition: "🍎 Питание", 
+    activity: "🏃 Активность", 
+    insulin: "💉 Инсулин", 
+    general: "📋 Общие", 
+    monitoring: "📊 Мониторинг" 
+  };
   
   return (
     <div style={styles.panel}>
@@ -1350,43 +925,23 @@ function RecommendationsPanel({ recommendations, loading }) {
 }
 
 function StatRow({ label, value }) {
-  return (
-    <div style={styles.statRow}>
-      <span style={styles.smallMuted}>{label}</span>
-      <span style={{ fontWeight: 500 }}>{value}</span>
-    </div>
-  );
+  return (<div style={styles.statRow}><span style={styles.smallMuted}>{label}</span><span style={{ fontWeight: 500 }}>{value}</span></div>);
 }
 
 function FullHistoryTable({ history, onExport }) {
   const [open, setOpen] = useState(false);
   const sorted = useMemo(() => [...history].sort((a, b) => b.t - a.t), [history]);
-
   return (
     <div style={styles.panel}>
       <div style={styles.historyHeaderRow}>
-        <button style={styles.historyToggleBtn} onClick={() => setOpen((v) => !v)}>
-          {open ? "▾" : "▸"} История измерений за выбранный период ({history.length})
-          — выбери «Всё время» вверху, чтобы увидеть все измерения
-        </button>
-        <button style={styles.exportBtn} onClick={onExport}>
-          Экспорт в CSV
-        </button>
+        <button style={styles.historyToggleBtn} onClick={() => setOpen((v) => !v)}>{open ? "▾" : "▸"} История измерений ({history.length})</button>
+        <button style={styles.exportBtn} onClick={onExport}>Экспорт в CSV</button>
       </div>
       {open && (
         <div style={styles.historyScroll}>
-          {sorted.length === 0 ? (
-            <div style={styles.smallMuted}>Измерений пока нет.</div>
-          ) : (
+          {sorted.length === 0 ? (<div style={styles.smallMuted}>Измерений пока нет.</div>) : (
             <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.th}>Дата</th>
-                  <th style={styles.th}>Время</th>
-                  <th style={styles.th}>Глюкоза</th>
-                  <th style={styles.th}>Статус</th>
-                </tr>
-              </thead>
+              <thead><tr><th style={styles.th}>Дата</th><th style={styles.th}>Время</th><th style={styles.th}>Глюкоза</th><th style={styles.th}>Статус</th></tr></thead>
               <tbody>
                 {sorted.map((d) => {
                   const dt = new Date(d.t);
@@ -1394,24 +949,10 @@ function FullHistoryTable({ history, onExport }) {
                   const meta = status ? STATUS_META[status] : null;
                   return (
                     <tr key={d.t}>
-                      <td style={styles.td}>
-                        {dt.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}
-                      </td>
-                      <td style={styles.td}>
-                        {dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}
-                      </td>
-                      <td style={styles.td}>
-                        {d.actual != null ? `${d.actual} ммоль/л` : "—"}
-                      </td>
-                      <td style={styles.td}>
-                        {meta && (
-                          <span
-                            style={{ ...styles.badge, color: meta.color, background: meta.bg }}
-                          >
-                            {meta.label}
-                          </span>
-                        )}
-                      </td>
+                      <td style={styles.td}>{dt.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}</td>
+                      <td style={styles.td}>{dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</td>
+                      <td style={styles.td}>{d.actual != null ? `${d.actual} ммоль/л` : "—"}</td>
+                      <td style={styles.td}>{meta && <span style={{ ...styles.badge, color: meta.color, background: meta.bg }}>{meta.label}</span>}</td>
                     </tr>
                   );
                 })}
@@ -1428,13 +969,10 @@ function Footer() {
   return (
     <div style={styles.footer}>
       <span>Версия клиента: 0.1.0</span>
-      <a href="#" style={styles.footerLink}>
-        Документация
-      </a>
+      <a href="#" style={styles.footerLink}>Документация</a>
     </div>
   );
 }
-
 // ============================================================================
 // Стили
 // ============================================================================
@@ -1444,16 +982,10 @@ const styles = {
     minHeight: "100vh",
     background: "#EEF0F3",
     padding: "32px 16px",
-    fontFamily:
-      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
     display: "flex",
     justifyContent: "center",
   },
-  recommendationsList: { display: "flex", flexDirection: "column", gap: 12 },
-  recommendationItem: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "12px 14px" },
-  recommendationType: { fontSize: 12, fontWeight: 600, color: "#0C447C", marginBottom: 6 },
-  recommendationText: { fontSize: 13, lineHeight: 1.5, color: "#52514e" },
-
   card: {
     width: "100%",
     maxWidth: 960,
@@ -1692,6 +1224,7 @@ const styles = {
     border: "1px solid #e1e0d9",
     borderRadius: 14,
     padding: "16px 18px",
+    marginBottom: 20,
   },
   panelTitle: { fontSize: 14, fontWeight: 500, marginBottom: 12 },
   historyHeaderRow: {
@@ -1869,6 +1402,10 @@ const styles = {
     marginTop: 2,
     wordBreak: "break-all",
   },
+  recommendationsList: { display: "flex", flexDirection: "column", gap: 12 },
+  recommendationItem: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "12px 14px" },
+  recommendationType: { fontSize: 12, fontWeight: 600, color: "#0C447C", marginBottom: 6 },
+  recommendationText: { fontSize: 13, lineHeight: 1.5, color: "#52514e" },
   loginIdDisplay: {
     fontFamily: "monospace",
     fontSize: 20,
@@ -2165,7 +1702,7 @@ function RegisterScreen({ onRegistered }) {
                     checked={role === "user"}
                     onChange={() => setRole("user")}
                   />
-                  Пациент 
+                  Пациент
                 </label>
                 <label style={styles.radioLabel}>
                   <input
