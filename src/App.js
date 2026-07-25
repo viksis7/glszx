@@ -714,42 +714,7 @@ const [patientId, setPatientId] = useState(null);
             )}
 
             <DebugPanel value={debugOverride} onChange={setDebugOverride} />
-            function RecommendationsPanel({ recommendations, loading }) {
-  if (loading) {
-    return (
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Рекомендации</div>
-        <div style={styles.skeleton} />
-      </div>
-    );
-  }
-  if (!recommendations) {
-    return (
-      <div style={styles.panel}>
-        <div style={styles.panelTitle}>Рекомендации</div>
-        <div style={styles.smallMuted}>Нет рекомендаций</div>
-      </div>
-    );
-  }
-  const items = Array.isArray(recommendations)
-    ? recommendations
-    : Object.entries(recommendations).map(([key, value]) => ({ type: key, text: value }));
-  const typeLabels = { nutrition: "🍎 Питание", activity: "🏃 Активность", insulin: "💉 Инсулин", general: "📋 Общие", monitoring: "📊 Мониторинг" };
-  
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelTitle}>Рекомендации</div>
-      <div style={styles.recommendationsList}>
-        {items.map((item, index) => (
-          <div key={index} style={styles.recommendationItem}>
-            <div style={styles.recommendationType}>{typeLabels[item.type] || item.type}</div>
-            <div style={styles.recommendationText}>{item.text}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+
 
             <div style={styles.statusRow}>
               <GlucoseCard latest={displayedLatest} loading={loading} />
@@ -1344,6 +1309,42 @@ function Statistics({ stats, loading }) {
     </div>
   );
 }
+function RecommendationsPanel({ recommendations, loading }) {
+  if (loading) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.skeleton} />
+      </div>
+    );
+  }
+  if (!recommendations) {
+    return (
+      <div style={styles.panel}>
+        <div style={styles.panelTitle}>Рекомендации</div>
+        <div style={styles.smallMuted}>Нет рекомендаций</div>
+      </div>
+    );
+  }
+  const items = Array.isArray(recommendations)
+    ? recommendations
+    : Object.entries(recommendations).map(([key, value]) => ({ type: key, text: value }));
+  const typeLabels = { nutrition: "🍎 Питание", activity: "🏃 Активность", insulin: "💉 Инсулин", general: "📋 Общие", monitoring: "📊 Мониторинг" };
+  
+  return (
+    <div style={styles.panel}>
+      <div style={styles.panelTitle}>Рекомендации</div>
+      <div style={styles.recommendationsList}>
+        {items.map((item, index) => (
+          <div key={index} style={styles.recommendationItem}>
+            <div style={styles.recommendationType}>{typeLabels[item.type] || item.type}</div>
+            <div style={styles.recommendationText}>{item.text}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function StatRow({ label, value }) {
   return (
@@ -1449,7 +1450,7 @@ const styles = {
   recommendationItem: { background: "#F7F6F2", border: "1px solid #e1e0d9", borderRadius: 10, padding: "12px 14px" },
   recommendationType: { fontSize: 12, fontWeight: 600, color: "#0C447C", marginBottom: 6 },
   recommendationText: { fontSize: 13, lineHeight: 1.5, color: "#52514e" },
-  
+
   card: {
     width: "100%",
     maxWidth: 960,
