@@ -192,28 +192,52 @@ function latestReadingFrom(history) {
 
 function latestForecastFrom(predictions) {
   if (!predictions || predictions.length === 0) return null;
+
   const now = Date.now();
-  const targetTime = now + 30 * 60 * 1000;
-  let closest = null;
-  let minDiff = Infinity;
-  for (const p of predictions) {
-    const predTime = new Date(p.TimePredicted).getTime();
-    if (predTime > now) {
-      const diff = Math.abs(predTime - targetTime);
-      if (diff < minDiff) { minDiff = diff; closest = p; }
-    }
+  const minDiff = 29 * 60 * 1000; // 29 минут в мс
+  const maxDiff = 60 * 60 * 1000; // 60 минут в мс
+
+  // Ищем предсказания в диапазоне 29–60 минут от сейчас
+  const candidates = predictions
+    .map((p) => {
+      const predTime = new Date(p.TimePredicted).getTime();
+      const diff = predTime - now;
+      return { p, predTime, diff };
+    })
+    .filter((item) => item.diff > minDiff && item.diff < maxDiff)
+    .sort((a, b) => a.diff - b.diff); // сортируем по возрастанию разницы
+
+  // Берём первое (ближайшее к 29 минутам)
+  if (candidates.length > 0) {
+    const chosen = candidates[0].p;
+    const value = toNum(chosen.GlucosePredicted);
+    if (value == null) return null;
+    return {
+      value,
+      forecastFor: chosen.TimePredicted, // показываем реальное время предсказания
+    };
   }
-  if (!closest) {
-    const sorted = [...predictions].sort(
-      (a, b) => new Date(b.TimePredicted) - new Date(a.TimePredicted)
-    );
-    closest = sorted[0];
+
+  // Фолбэк: если в диапазоне 29–60 мин ничего нет — берём ближайшее будущее
+  const future = predictions
+    .map((p) => ({ p, predTime: new Date(p.TimePredicted).getTime() }))
+    .filter((item) => item.predTime > now)
+    .sort((a, b) => a.predTime - b.predTime);
+
+  if (future.length > 0) {
+    const value = toNum(future[0].p.GlucosePredicted);
+    if (value == null) return null;
+    return { value, forecastFor: future[0].p.TimePredicted };
   }
-  if (!closest) return null;
-  const value = toNum(closest.GlucosePredicted);
+
+  // Последний фолбэк: самое позднее предсказание
+  const sorted = [...predictions].sort(
+    (a, b) => new Date(b.TimePredicted) - new Date(a.TimePredicted)
+  );
+  const last = sorted[0];
+  const value = toNum(last.GlucosePredicted);
   if (value == null) return null;
-  const displayTime = new Date(targetTime);
-  return { value, forecastFor: displayTime.toISOString() };
+  return { value, forecastFor: last.TimePredicted };
 }
 
 function computeStats(historyRows) {
@@ -423,6 +447,13 @@ function Dashboard({ session, onLogout }) {
   const [whatIfData, setWhatIfData] = useState({ points: [], netEffect: 0 });
   const [whatIfLoading, setWhatIfLoading] = useState(false);
 
+    // Состояния для создания пациента
+    const [showCreatePatient, setShowCreatePatient] = useState(false);
+    const [newPatientName, setNewPatientName] = useState("");
+    const [newPatientId, setNewPatientId] = useState("");
+    const [creatingPatient, setCreatingPatient] = useState(false);
+    const [createPatientError, setCreatePatientError] = useState(null);
+
   const patient = patients.find((p) => p.id === patientId) || patients[0] || null;
   const pollRef = useRef(null);
 
@@ -480,7 +511,27 @@ try {
 
     setLoading(false);
   }, [patientId, currentPeriod]);
-
+  const handleCreatePatient = async () => {
+    if (!newPatientName.trim() || !newPatientId.trim()) {
+      setCreatePatientError("Заполните имя и ID пациента");
+      return;
+    }
+    setCreatingPatient(true);
+    setCreatePatientError(null);
+    try {
+      const hospitalId = session.hospitalId;
+      const created = await createPatientUser(newPatientId.trim(), newPatientName.trim(), hospitalId);
+      setPatients((prev) => [...prev, { id: created.ID, name: created.Name }]);
+      setNewPatientName("");
+      setNewPatientId("");
+      setShowCreatePatient(false);
+      setPatientId(created.ID);
+    } catch (err) {
+      setCreatePatientError("Не удалось создать пациента. Возможно, ID уже занят.");
+    } finally {
+      setCreatingPatient(false);
+    }
+  };
   useEffect(() => {
     setLoading(true);
     loadAll();
@@ -558,7 +609,15 @@ try {
   return (
     <div style={styles.page}>
       <div style={styles.card}>
-        <Header patient={patient} patients={patients} onPatientChange={setPatientId} connected={connected} session={session} onLogout={onLogout} />
+      <Header 
+  patient={patient} 
+  patients={patients} 
+  onPatientChange={setPatientId} 
+  connected={connected} 
+  session={session} 
+  onLogout={onLogout}
+  onCreatePatient={() => setShowCreatePatient(true)}
+/>
 
         {!patientsLoaded ? (
           <div style={styles.emptyState}>Загружаем список пациентов…</div>
@@ -611,6 +670,33 @@ try {
             />
           </>
         )}
+                {showCreatePatient && (
+          <div style={styles.modalOverlay}>
+            <div style={styles.modalContent}>
+              <div style={styles.modalHeader}>
+                <h3 style={styles.modalTitle}>Создание нового пациента</h3>
+                <button style={styles.modalCloseBtn} onClick={() => { setShowCreatePatient(false); setCreatePatientError(null); setNewPatientName(""); setNewPatientId(""); }}>×</button>
+              </div>
+              <div style={styles.modalBody}>
+                {createPatientError && <div style={styles.errorBanner}>{createPatientError}</div>}
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>Имя пациента</label>
+                  <input type="text" value={newPatientName} onChange={(e) => setNewPatientName(e.target.value)} placeholder="Например, Иван Петров" style={styles.formInput} autoFocus />
+                </div>
+                <div style={styles.formGroup}>
+                  <label style={styles.formLabel}>ID пациента <span style={styles.formHint}>(только цифры, 6 знаков)</span></label>
+                  <input type="text" value={newPatientId} onChange={(e) => setNewPatientId(e.target.value.replace(/\D/g, ''))} placeholder="Например, 123456" maxLength={6} style={styles.formInput} />
+                </div>
+                <div style={styles.modalFooter}>
+                  <button style={styles.cancelBtn} onClick={() => { setShowCreatePatient(false); setCreatePatientError(null); setNewPatientName(""); setNewPatientId(""); }} disabled={creatingPatient}>Отмена</button>
+                  <button style={styles.createBtn} onClick={handleCreatePatient} disabled={creatingPatient || !newPatientName.trim() || !newPatientId.trim()}>
+                    {creatingPatient ? "Создание..." : "Создать"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         <Footer />
       </div>
     </div>
@@ -621,7 +707,7 @@ try {
 // Подкомпоненты
 // ============================================================================
 
-function Header({ patient, patients, onPatientChange, connected, session, onLogout }) {
+function Header({ patient, patients, onPatientChange, connected, session, onLogout, onCreatePatient }) {
   return (
     <div style={styles.header}>
       <div style={styles.logo}>
@@ -635,13 +721,17 @@ function Header({ patient, patients, onPatientChange, connected, session, onLogo
           <span style={styles.accountId}>ID: {session.loginId || session.id}</span>
         </div>
 
+        {session.role === "admin" && (
+          <button style={styles.createPatientBtn} onClick={onCreatePatient}>+ Создать пациента</button>
+        )}
+
         {session.role === "admin" ? (
           <label style={styles.patientLabel}>
             Пациент:
             {patients.length === 0 ? (
               <span style={styles.smallMuted}> нет пациентов</span>
             ) : (
-              <select value={String(patient?.id ?? "")} onChange={(e) => onPatientChange(e.target.value)} style={styles.select}>
+              <select value={String(patient?.id ?? "")}onChange={(e) => onPatientChange(Number(e.target.value))}>
                 {patients.map((p) => (<option key={p.id} value={p.id}>{p.name}</option>))}
               </select>
             )}
@@ -1428,6 +1518,19 @@ const styles = {
     color: "#0b0b0b",
     cursor: "pointer",
   },
+  createPatientBtn: { background: "#0F6E56", color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 500, marginLeft: 8 },
+  modalOverlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  modalContent: { background: "#fff", borderRadius: 16, padding: 24, width: "90%", maxWidth: 440, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" },
+  modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 },
+  modalTitle: { margin: 0, fontSize: 18, fontWeight: 600, color: "#0b0b0b" },
+  modalCloseBtn: { background: "none", border: "none", fontSize: 28, cursor: "pointer", color: "#898781", lineHeight: 1, padding: 0 },
+  modalBody: {},
+  formGroup: { marginBottom: 16 },
+  formHint: { fontSize: 11, color: "#898781", fontWeight: 400, marginLeft: 6 },
+  formInput: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #d3d1c7", fontSize: 14, marginTop: 6, boxSizing: "border-box" },
+  modalFooter: { display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 24 },
+  cancelBtn: { background: "#fff", border: "1px solid #d3d1c7", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#52514e" },
+  createBtn: { background: "#0F6E56", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 14, cursor: "pointer", color: "#fff", fontWeight: 500 },
 };
 
 // ============================================================================
