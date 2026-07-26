@@ -53,7 +53,15 @@ function genPatientId() {
 
 function toNum(v) {
   const n = typeof v === "string" ? parseFloat(v) : v;
-  return Number.isFinite(n) ? n : null;
+  if (!Number.isFinite(n)) return null;
+  
+  // Если значение > 50, скорее всего это мг/дл — конвертируем в ммоль/л
+  // (норма 70-100 мг/дл = 3.9-5.6 ммоль/л)
+  if (n > 50) {
+    return Number((n / 18.0182).toFixed(1)); // конвертация мг/дл → ммоль/л
+  }
+  
+  return Number(n.toFixed(1));
 }
 
 async function apiFetch(path, options) {
