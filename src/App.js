@@ -53,15 +53,7 @@ function genPatientId() {
 
 function toNum(v) {
   const n = typeof v === "string" ? parseFloat(v) : v;
-  if (!Number.isFinite(n)) return null;
-  
-  // Если значение > 50, скорее всего это мг/дл — конвертируем в ммоль/л
-  // (норма 70-100 мг/дл = 3.9-5.6 ммоль/л)
-  if (n > 50) {
-    return Number((n / 18.0182).toFixed(1)); // конвертация мг/дл → ммоль/л
-  }
-  
-  return Number(n.toFixed(1));
+  return Number.isFinite(n) ? n : null;
 }
 
 async function apiFetch(path, options) {
@@ -1066,7 +1058,7 @@ function FullHistoryTable({ history, onExport }) {
 function Footer() {
   return (
     <div style={styles.footer}>
-      <span>Версия клиента: 0.1.0</span>
+      <span>Версия клиента: 1.0.0</span>
       <a href="#" style={styles.footerLink}>Документация</a>
     </div>
   );
